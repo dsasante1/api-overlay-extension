@@ -328,11 +328,27 @@ function isSafeId(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < Number.MAX_SAFE_INTEGER;
 }
 
-window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
-  if (e.source !== window) return;
-  if (!e.data?.__apiOverlay || !activated) return;
-  const msg = e.data;
+// Requests intercepted by the injected hook before the overlay is activated. The
+// hook is installed at document_start (see injectHook) so it captures load-time
+// requests, but there is no UI to show them until the user activates. Buffer them
+// (bounded, oldest dropped on overflow) and replay via drainPreActivationBuffer
+// once the panel/pill is built.
+const preActivationBuffer: OverlayMessage[] = [];
+const MAX_PREACTIVATION_BUFFER = 2000;
 
+function bufferPreActivation(msg: OverlayMessage): void {
+  preActivationBuffer.push(msg);
+  if (preActivationBuffer.length > MAX_PREACTIVATION_BUFFER) preActivationBuffer.shift();
+}
+
+function drainPreActivationBuffer(): void {
+  if (!preActivationBuffer.length) return;
+  const pending = preActivationBuffer.splice(0, preActivationBuffer.length);
+  for (const m of pending) handleOverlayMessage(m);
+  scheduleRenderUnlessPaused();
+}
+
+function handleOverlayMessage(msg: OverlayMessage): void {
   if (msg.__wsMsg) {
     if (!isSafeId(msg.wsId)) return;
     const conn = requests.get(msg.wsId);
@@ -388,6 +404,16 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
     const req = requests.get(msg.id);
     if (req) flashBadge(req);
   }
+}
+
+window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
+  if (e.source !== window) return;
+  if (!e.data?.__apiOverlay) return;
+  const msg = e.data;
+  // Before activation there is no UI; hold captured requests so they can be
+  // replayed once the overlay opens (drainPreActivationBuffer).
+  if (!activated) { bufferPreActivation(msg); return; }
+  handleOverlayMessage(msg);
 });
 
 chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, _sender, sendResponse) => {
@@ -3435,21 +3461,32 @@ function injectStyles(): void {
 
 // ── Activation / deactivation ─────────────────────────────────────────────────
 
-let injectedLoaded = false;
+let injectionAttempted = false;
+
+// Install the page-context capture hook as early as possible (document_start,
+// before the page's own scripts run) so requests fired during initial load are
+// intercepted. The hook emits unconditionally; the overlay decides whether to
+// display or buffer (see the message listener). Injected once per page load.
+function injectHook(): void {
+  if (injectionAttempted) return;
+  injectionAttempted = true;
+  const script = document.createElement('script');
+  script.src = chrome.runtime.getURL('dist/injected.js');
+  // Preserve execution order relative to other parser/script-inserted scripts so
+  // the hook wins the race against the page's own early scripts where possible.
+  script.async = false;
+  script.onload = () => { script.remove(); };
+  script.onerror = () => { script.remove(); cspBlocked = true; if (activated) renderList(); };
+  (document.head || document.documentElement).prepend(script);
+}
 
 function activateOverlay(): void {
   if (activated) return;
   activated = true;
-  cspBlocked = false;
-  if (!injectedLoaded) {
-    const script = document.createElement('script');
-    script.src = chrome.runtime.getURL('dist/injected.js');
-    script.onload = () => { injectedLoaded = true; script.remove(); };
-    script.onerror = () => { script.remove(); cspBlocked = true; renderList(); };
-    (document.head || document.documentElement).prepend(script);
-  } else {
-    signalInjected('start');
-  }
+  // The capture hook is already installed at document_start (injectHook); here we
+  // only (re)enable emission in case a prior deactivate stopped it. Requests seen
+  // before activation were buffered and are replayed by drainPreActivationBuffer.
+  signalInjected('start');
 
   const init = () => {
     loadFont().then(({ family, size }) => applyFont(family, size));
@@ -3472,6 +3509,8 @@ function activateOverlay(): void {
         hydrateFromPreserved(() => {
           if (dockState === 'pill') buildPill();
           else buildPanel();
+          // Replay anything captured before the UI existed (load-time requests).
+          drainPreActivationBuffer();
         });
       });
     });
@@ -3549,7 +3588,7 @@ function deactivateOverlay(): void {
   activeFlags.clear();
   paused = false;
   panelVisible = true;
-  cspBlocked = false;
+  preActivationBuffer.length = 0;
   dockState = 'panel';
   showPinTray = false;
   ghostHeld = false;
@@ -3577,6 +3616,12 @@ window.addEventListener('keyup', (e: KeyboardEvent) => {
   $('ov-panel')?.classList.remove('ov-ghost');
   $('ov-pill')?.classList.remove('ov-ghost');
 });
+
+// Install the capture hook now, at document_start, regardless of whether the
+// overlay is ever activated — otherwise requests fired during initial page load
+// (common on server-rendered / jQuery sites) are gone before the user opens the
+// overlay. Captured-but-undisplayed requests are buffered until activation.
+injectHook();
 
 // ── Host allowlist ────────────────────────────────────────────────────────────
 
