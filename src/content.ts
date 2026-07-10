@@ -90,6 +90,7 @@ const detailTabs = new Map<number, DetailTab>();
 const activeStatus = new Set<string>();
 const activeMethods = new Set<string>();
 const activeInitiators = new Set<string>();
+const activeFlags = new Set<string>();   // 'err' | 'slow' — derived footer filters
 
 // pin state
 const pinnedIds = new Set<number>();
@@ -1401,8 +1402,8 @@ function renderFooter(): void {
   }
   footer.innerHTML = `
     <span class="ov-fstat">req <b>${requests.size}</b></span>
-    <span class="ov-fstat${err ? ' ov-fstat-err' : ''}">err <b>${err}</b></span>
-    <span class="ov-fstat${slow ? ' ov-fstat-warn' : ''}">slow <b>${slow}</b></span>
+    <button class="ov-fstat ov-fstat-btn${err ? ' ov-fstat-err' : ''}${activeFlags.has('err') ? ' on' : ''}" data-f="err" ${err ? '' : 'disabled'} data-tip="Filter: error requests">err <b>${err}</b></button>
+    <button class="ov-fstat ov-fstat-btn${slow ? ' ov-fstat-warn' : ''}${activeFlags.has('slow') ? ' on' : ''}" data-f="slow" ${slow ? '' : 'disabled'} data-tip="Filter: slow (&gt;800ms)">slow <b>${slow}</b></button>
     <span class="ov-fstat">xfer <b>${(xfer / 1024).toFixed(1)}kb</b></span>
     <span class="ov-fspacer"></span>
     <button class="ov-pin-toggle${showPinTray ? ' on' : ''}" id="ov-pin-tray-btn" data-tip="Show / hide pinned requests" data-tip-pos="above" data-tip-align="right">★ ${pinnedIds.size}</button>
@@ -1483,6 +1484,14 @@ function renderList(): void {
     return activeInitiators.has(ini);
   }
 
+  // AND semantics: 'err' + 'slow' both selected ⇒ only slow errors.
+  function matchesFlags(r: ApiRequest): boolean {
+    if (activeFlags.size === 0) return true;
+    if (activeFlags.has('err')  && !isError(r)) return false;
+    if (activeFlags.has('slow') && (r.ms ?? 0) <= 800) return false;
+    return true;
+  }
+
   const snapshot = Array.from(requests.values());
   const visible: ApiRequest[] = [];
   for (let i = snapshot.length - 1; i >= 0 && visible.length < RENDER_LIMIT; i--) {
@@ -1490,6 +1499,7 @@ function renderList(): void {
     if (!matchesMethod(r)) continue;
     if (!matchesStatus(r)) continue;
     if (!matchesInitiator(r)) continue;
+    if (!matchesFlags(r)) continue;
     if (!matchesText(r)) continue;
     visible.push(r);
   }
@@ -1725,10 +1735,27 @@ function bindChipDelegation(container: HTMLElement): void {
       chip.classList.toggle('on', activeInitiators.has(ini));
     }
 
-    chrome.storage.local.set({ ovFilters: {
-      status: [...activeStatus], methods: [...activeMethods], initiators: [...activeInitiators]
-    }});
+    persistFilters();
     renderList();
+  });
+}
+
+function persistFilters(): void {
+  chrome.storage.local.set({ ovFilters: {
+    status: [...activeStatus], methods: [...activeMethods],
+    initiators: [...activeInitiators], flags: [...activeFlags],
+  }});
+}
+
+function bindFooterDelegation(container: HTMLElement): void {
+  container.addEventListener('click', (e: Event) => {
+    const btn = (e.target as Element).closest<HTMLElement>('.ov-fstat-btn');
+    if (!btn || (btn as HTMLButtonElement).disabled) return;
+    const f = btn.dataset.f;
+    if (!f) return;
+    activeFlags.has(f) ? activeFlags.delete(f) : activeFlags.add(f);
+    persistFilters();
+    renderList();   // renderFooter (called within) re-derives the .on state
   });
 }
 
@@ -1938,6 +1965,7 @@ function buildPanel(): void {
   const list = $('ov-list')!;
   bindListDelegation(list);
   bindChipDelegation($('ov-chips')!);
+  bindFooterDelegation($('ov-footer')!);
   renderList();
 }
 
@@ -3063,6 +3091,23 @@ function injectStyles(): void {
     .ov-fstat b { color: var(--ov-text) !important; font-weight: 700 !important; }
     .ov-fstat-err b { color: var(--ov-s-err) !important; }
     .ov-fstat-warn b { color: var(--ov-s-4xx) !important; }
+    .ov-fstat-btn {
+      all: unset !important;
+      cursor: pointer !important;
+      font-family: inherit !important;
+      font-size: inherit !important;
+      color: var(--ov-text-muted) !important;
+      padding: 1px 4px !important;
+      border: 1px solid transparent !important;
+      border-radius: 2px !important;
+    }
+    .ov-fstat-btn:hover { border-color: var(--ov-text-muted) !important; }
+    .ov-fstat-btn.on {
+      border-color: var(--ov-accent) !important;
+      background: var(--ov-accent-bg) !important;
+    }
+    .ov-fstat-btn:disabled { cursor: default !important; opacity: .55 !important; }
+    .ov-fstat-btn:disabled:hover { border-color: transparent !important; }
     .ov-fspacer { flex: 1 !important; }
     .ov-pin-toggle {
       all: unset !important;
@@ -3416,10 +3461,11 @@ function activateOverlay(): void {
           for (const k of result.ovPinnedKeys) pinnedKeys.add(k);
         }
         if (result.ovFilters) {
-          const f = result.ovFilters as { status?: string[]; methods?: string[]; initiators?: string[] };
+          const f = result.ovFilters as { status?: string[]; methods?: string[]; initiators?: string[]; flags?: string[] };
           if (f.status) for (const s of f.status) activeStatus.add(s);
           if (f.methods) for (const m of f.methods) activeMethods.add(m);
           if (f.initiators) for (const i of f.initiators) activeInitiators.add(i);
+          if (f.flags) for (const fl of f.flags) activeFlags.add(fl);
         }
         savedPanelGeom = isValidPanelGeom(result.ovPanelGeom) ? result.ovPanelGeom : null;
         savedPillGeom = isValidPillGeom(result.ovPillGeom) ? result.ovPillGeom : null;
@@ -3500,6 +3546,7 @@ function deactivateOverlay(): void {
   activeStatus.clear();
   activeMethods.clear();
   activeInitiators.clear();
+  activeFlags.clear();
   paused = false;
   panelVisible = true;
   cspBlocked = false;
