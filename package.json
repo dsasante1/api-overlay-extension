@@ -4,6 +4,7 @@
   "scripts": {
     "build": "tsc",
     "watch": "tsc --watch",
+    "pretest": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
