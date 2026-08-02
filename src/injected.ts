@@ -27,6 +27,12 @@ interface XMLHttpRequest {
   let capturing = true;
   let stopped = false;
 
+  // Same-origin target for the page ↔ content-script channel. Opaque origins
+  // (file://, sandboxed frames) serialize as the string "null", which is not a
+  // valid targetOrigin and makes postMessage throw, so fall back to '*' there.
+  // The payload carries no secrets — only capture records the page already has.
+  const TARGET_ORIGIN = location.origin && location.origin !== 'null' ? location.origin : '*';
+
   const TEXTLIKE_CT = /^(?:text\/|application\/(?:json|ld\+json|xml|x-www-form-urlencoded|graphql|javascript|x-ndjson)|application\/.*\+json)/i;
   // Upper bound on a single captured request/response body. Set high enough to
   // show full API responses rather than a truncated preview; the ceiling only
@@ -83,6 +89,7 @@ interface XMLHttpRequest {
 
   window.addEventListener('message', (e: MessageEvent) => {
     if (e.source !== window) return;
+    if (TARGET_ORIGIN !== '*' && e.origin !== TARGET_ORIGIN) return;
     const data = e.data;
     if (!data || data.__apiOverlayControl !== true) return;
     if (data.action === 'pause') capturing = false;
@@ -166,7 +173,7 @@ interface XMLHttpRequest {
   }
 
   function emit(data: Record<string, unknown>): void {
-    window.postMessage({ __apiOverlay: true, ...data }, '*');
+    window.postMessage({ __apiOverlay: true, ...data }, TARGET_ORIGIN);
   }
 
   function redactHeaderValue(name: string, value: string): string {
@@ -233,7 +240,7 @@ interface XMLHttpRequest {
   }
 
   function isTextLikeResponse(res: Response): boolean {
-    const ct = res.headers.get('content-type') || '';
+    const ct = res.headers.get('content-type') ?? '';
     if (ct && !TEXTLIKE_CT.test(ct)) return false;
     const cl = res.headers.get('content-length');
     if (cl) {
@@ -288,12 +295,12 @@ interface XMLHttpRequest {
       url = args[0].url;
       method = args[0].method.toUpperCase();
       reqHeaders = headersFromObject(args[0].headers);
-      const init = args[1] as RequestInit | undefined;
+      const init = args[1];
       if (init?.headers) reqHeaders = serializeHeaders(init.headers) ?? reqHeaders;
     } else {
       url = String(args[0]);
-      const init = args[1] as RequestInit | undefined;
-      method = (init?.method || 'GET').toUpperCase();
+      const init = args[1];
+      method = (init?.method ?? 'GET').toUpperCase();
       reqBody = redactBody(extractBody(init?.body));
       reqHeaders = serializeHeaders(init?.headers);
     }
@@ -351,8 +358,8 @@ interface XMLHttpRequest {
   XMLHttpRequest.prototype.send = function (...args: Parameters<typeof XMLHttpRequest.prototype.send>): void {
     if (stopped || !capturing) { _send.apply(this, args); return; }
     const id = ++requestId;
-    const method = this.__ov_method || 'GET';
-    const url = this.__ov_url || '';
+    const method = this.__ov_method ?? 'GET';
+    const url = this.__ov_url ?? '';
     const reqBody = redactBody(extractBody(args[0] as BodyInit | Document | null));
     const reqHeaders = this.__ov_req_headers ? this.__ov_req_headers.slice() : null;
     const el = getInteractedElement();
@@ -369,7 +376,7 @@ interface XMLHttpRequest {
       const cl = xhr.getResponseHeader('content-length');
       const tooBig = cl ? (() => { const n = Number(cl); return Number.isFinite(n) && n > MAX_INSPECTED_BODY; })() : false;
       if (!tooBig && (xhr.responseType === '' || xhr.responseType === 'text')) {
-        const ct = xhr.getResponseHeader('content-type') || '';
+        const ct = xhr.getResponseHeader('content-type') ?? '';
         if (!ct || TEXTLIKE_CT.test(ct)) {
           resBody = redactBody(xhr.responseText?.slice(0, MAX_BODY_BYTES) ?? null);
         }

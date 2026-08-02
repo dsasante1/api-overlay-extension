@@ -11,11 +11,17 @@ let currentHostname = '';
 let currentTabId: number | null = null;
 let requestCount = 0;
 
-function sendMessageSafe(tabId: number, message: Record<string, unknown>): Promise<unknown | null> {
+// Reading chrome.runtime.lastError is what suppresses the "Unchecked
+// runtime.lastError" console warning; the value itself is never needed.
+function swallowPopupLastError(): void {
+  if (chrome.runtime.lastError) { /* intentionally ignored */ }
+}
+
+function sendMessageSafe(tabId: number, message: Record<string, unknown>): Promise<unknown> {
   return new Promise(resolve => {
     try {
       chrome.tabs.sendMessage(tabId, message, response => {
-        void chrome.runtime.lastError;
+        swallowPopupLastError();
         resolve(response ?? null);
       });
     } catch {
@@ -209,9 +215,9 @@ async function init(): Promise<void> {
       { visible?: boolean; paused?: boolean; theme?: 'dark' | 'light';
         fontFamily?: PopupFontFamilyKey; fontSize?: PopupFontSizeKey; count?: number } | null;
     if (resp) {
-      applyPopupTheme(resp.theme || 'dark');
-      applyPopupFontFamily(resp.fontFamily || 'mono');
-      applyPopupFontSize(resp.fontSize || 'm');
+      applyPopupTheme(resp.theme ?? 'dark');
+      applyPopupFontFamily(resp.fontFamily ?? 'mono');
+      applyPopupFontSize(resp.fontSize ?? 'm');
       applyVisibleState(resp.visible !== false);
       applyPausedState(resp.paused === true);
       if (typeof resp.count === 'number') requestCount = resp.count;
