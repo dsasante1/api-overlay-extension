@@ -360,54 +360,61 @@ function drainPreActivationBuffer(): void {
   scheduleRenderUnlessPaused();
 }
 
-function handleOverlayMessage(msg: OverlayMessage): void {
-  if (msg.__wsMsg) {
-    if (!isSafeId(msg.wsId)) return;
-    const conn = requests.get(msg.wsId);
-    if (conn) {
-      if (!conn.messages) conn.messages = [];
-      if (msg.dir && msg.body != null && msg.ts != null) {
-        const wsmsg: WsMessage = { dir: msg.dir, body: msg.body, ts: msg.ts };
-        conn.messages.push(wsmsg);
-        // Send as a delta so the SW appends instead of re-serializing the
-        // entire (growing) messages array on every chatty-WS tick.
-        markWsMessagePending(conn.id, wsmsg);
-      }
-      if (conn.messages.length > WS_TRIM_TRIGGER) {
-        conn.messages.splice(0, conn.messages.length - MAX_WS_MESSAGES_PER_CONN);
-      }
-      if (expandedIds.has(conn.id)) scheduleRenderUnlessPaused();
-    }
-    return;
+// Append one frame to its parent connection. Frames whose connection is gone
+// (evicted, or never captured) are dropped.
+function applyWsFrame(msg: OverlayMessage): void {
+  if (!isSafeId(msg.wsId)) return;
+  const conn = requests.get(msg.wsId);
+  if (!conn) return;
+  conn.messages ??= [];
+  if (msg.dir && msg.body != null && msg.ts != null) {
+    const wsmsg: WsMessage = { dir: msg.dir, body: msg.body, ts: msg.ts };
+    conn.messages.push(wsmsg);
+    // Send as a delta so the SW appends instead of re-serializing the
+    // entire (growing) messages array on every chatty-WS tick.
+    markWsMessagePending(conn.id, wsmsg);
   }
+  if (conn.messages.length > WS_TRIM_TRIGGER) {
+    conn.messages.splice(0, conn.messages.length - MAX_WS_MESSAGES_PER_CONN);
+  }
+  if (expandedIds.has(conn.id)) scheduleRenderUnlessPaused();
+}
 
+// Merge an update into the row it belongs to. Updates land even while paused —
+// pause only gates *new* entries (see updateExistingRequest's counterpart).
+function updateExistingRequest(existing: ApiRequest, msg: OverlayMessage): void {
+  // element is re-evaluated on updates (e.g. the response emit), so the
+  // selector can change or drop — invalidate the index when it does.
+  const prevSel = existing.element?.selector;
+  Object.assign(existing, msg);
+  if (msg.element !== undefined && existing.element?.selector !== prevSel) requestsRev++;
+  refreshSearchCache(existing, msg);
+  // sync pin by key
+  if (pinnedKeys.has(pinKey(existing))) pinnedIds.add(existing.id);
+  markPreserveDirty(existing.id);
+}
+
+function insertNewRequest(msg: OverlayMessage): void {
+  const fresh = { ...msg } as ApiRequest;
+  refreshSearchCache(fresh, msg);
+  requests.set(fresh.id, fresh);
+  requestsRev++;   // new triggering-element → id mapping
+  // restore pin state from persisted keys
+  if (pinnedKeys.has(pinKey(fresh))) pinnedIds.add(fresh.id);
+  trimRequests();
+  markPreserveDirty(fresh.id);
+}
+
+function handleOverlayMessage(msg: OverlayMessage): void {
+  if (msg.__wsMsg) { applyWsFrame(msg); return; }
   if (!isSafeId(msg.id)) return;
 
-  if (requests.has(msg.id)) {
-    const existing = requests.get(msg.id)!;
-    // element is re-evaluated on updates (e.g. the response emit), so the
-    // selector can change or drop — invalidate the index when it does.
-    const prevSel = existing.element?.selector;
-    Object.assign(existing, msg);
-    if (msg.element !== undefined && existing.element?.selector !== prevSel) requestsRev++;
-    refreshSearchCache(existing, msg);
-    // sync pin by key
-    const key = pinKey(existing);
-    if (pinnedKeys.has(key)) pinnedIds.add(existing.id);
-    // Updates to existing rows are preserved even while paused — pause only
-    // gates *new* entries (the `return` below). Keep this in sync if you ever
-    // refactor the pause semantics.
-    markPreserveDirty(existing.id);
+  const existing = requests.get(msg.id);
+  if (existing) {
+    updateExistingRequest(existing, msg);
   } else {
-    if (paused) return;
-    const fresh = { ...msg } as ApiRequest;
-    refreshSearchCache(fresh, msg);
-    requests.set(msg.id, fresh);
-    requestsRev++;   // new triggering-element → id mapping
-    // restore pin state from persisted keys
-    if (pinnedKeys.has(pinKey(fresh))) pinnedIds.add(fresh.id);
-    trimRequests();
-    markPreserveDirty(fresh.id);
+    if (paused) return;   // pause gates new entries only
+    insertNewRequest(msg);
   }
 
   scheduleRenderUnlessPaused();
@@ -653,6 +660,11 @@ function parseJsonBody(text: string | null | undefined): { value: unknown; trunc
   return partial === undefined ? undefined : { value: partial, truncated: true };
 }
 
+const SIMPLE_ESCAPES = new Map<string, string>([
+  ['"', '"'], ['\\', '\\'], ['/', '/'],
+  ['b', '\b'], ['f', '\f'], ['n', '\n'], ['r', '\r'], ['t', '\t'],
+]);
+
 // Recursive-descent JSON parser that tolerates end-of-input at any point: an
 // unfinished string is kept as far as it was read, an unfinished object/array
 // drops only its incomplete trailing element, and an unfinished value is
@@ -670,37 +682,29 @@ function parsePartialJson(src: string): unknown {
     }
   }
 
+  // Decode the escape whose backslash was just consumed. Advances `i` past the
+  // sequence. A \\u that runs past end-of-input consumes the rest (the string is
+  // truncated); a malformed \\u yields nothing and leaves `i` on the digits, so
+  // they are re-read as literals — matching the original switch exactly.
+  function parseEscape(): string {
+    const e = src[i++];
+    if (e !== 'u') return SIMPLE_ESCAPES.get(e) ?? e;
+    if (i + 4 > n) { i = n; return ''; }
+    const code = parseInt(src.slice(i, i + 4), 16);
+    if (Number.isNaN(code)) return '';
+    i += 4;
+    return String.fromCharCode(code);
+  }
+
   function parseString(): string {
     i++; // opening quote
     let out = '';
     while (i < n) {
       const ch = src[i++];
-      if (ch === '\\') {
-        if (i >= n) break; // truncated escape
-        const e = src[i++];
-        switch (e) {
-          case '"': out += '"'; break;
-          case '\\': out += '\\'; break;
-          case '/': out += '/'; break;
-          case 'b': out += '\b'; break;
-          case 'f': out += '\f'; break;
-          case 'n': out += '\n'; break;
-          case 'r': out += '\r'; break;
-          case 't': out += '\t'; break;
-          case 'u': {
-            if (i + 4 <= n) {
-              const code = parseInt(src.slice(i, i + 4), 16);
-              if (!Number.isNaN(code)) { out += String.fromCharCode(code); i += 4; }
-            } else { i = n; }
-            break;
-          }
-          default: out += e;
-        }
-      } else if (ch === '"') {
-        return out;
-      } else {
-        out += ch;
-      }
+      if (ch === '"') return out;
+      if (ch !== '\\') { out += ch; continue; }
+      if (i >= n) break; // truncated escape
+      out += parseEscape();
     }
     return out; // truncated mid-string
   }
@@ -794,22 +798,26 @@ function byteSize(r: ApiRequest): number {
 
 // ── Status bucket ─────────────────────────────────────────────────────────────
 
+// A websocket row is only "successful" as a completed handshake (101) or a
+// clean close; any other status on a ws row is a failure.
+function wsStatusBucket(s: RequestStatus): string {
+  return s === 'closed' || s === 101 ? '2xx' : 'err';
+}
+
+function httpStatusBucket(s: number): string {
+  if (s >= 500) return '5xx';
+  if (s >= 400) return '4xx';
+  if (s >= 300) return '3xx';
+  if (s >= 200) return '2xx';
+  return 'err';   // 1xx and anything below
+}
+
 function statusBucket(req: ApiRequest): string {
   const s = req.status;
   if (s === 'pending') return 'pending';
   if (s === 'error') return 'err';
-  if (req.kind === 'ws') {
-    if (s === 'closed') return '2xx';
-    if (typeof s === 'number' && s === 101) return '2xx';
-    return 'err';
-  }
-  if (typeof s === 'number') {
-    if (s >= 500) return '5xx';
-    if (s >= 400) return '4xx';
-    if (s >= 300) return '3xx';
-    if (s >= 200) return '2xx';
-  }
-  return 'err';
+  if (req.kind === 'ws') return wsStatusBucket(s);
+  return typeof s === 'number' ? httpStatusBucket(s) : 'err';
 }
 
 // ── JSON rendering ────────────────────────────────────────────────────────────
@@ -855,47 +863,58 @@ function flattenJsonRows(value: unknown): JsonRow[] {
     k === null ? [] : [textSeg(`<span class="ov-jk">"${escHtml(k)}"</span>: `)];
 
   let capped = false;
-  function walk(v: unknown, depth: number, key: string | null, trailing: boolean): void {
-    if (rows.length >= MAX_JSON_ROWS) { capped = true; return; }
+  // One row for a scalar leaf. Returns false when `v` is not a scalar, so the
+  // caller falls through to the container / fallback handling.
+  function pushScalar(v: unknown, depth: number, key: string | null, trailing: boolean): boolean {
     if (v === null) {
       rows.push({ depth, segs: [...keySeg(key), leafSeg('null', 'null', 'null'), ...commaSeg(trailing)] });
-      return;
+      return true;
     }
     const t = typeof v;
     if (t === 'string') {
-      const s = v as string;
-      const cut = s.length > MAX_JSON_LEAF_LEN ? s.slice(0, MAX_JSON_LEAF_LEN) : s;
-      const ell = cut.length < s.length ? '…' : '';
+      const str = v as string;
+      const cut = str.length > MAX_JSON_LEAF_LEN ? str.slice(0, MAX_JSON_LEAF_LEN) : str;
+      const ell = cut.length < str.length ? '…' : '';
       rows.push({ depth, segs: [...keySeg(key), leafSeg('string', `"${escHtml(escJsonControl(cut))}${ell}"`, cut), ...commaSeg(trailing)] });
-      return;
+      return true;
     }
     if (t === 'number' || t === 'boolean') {
       const display = String(v);
       rows.push({ depth, segs: [...keySeg(key), leafSeg(t as JsonLeafKind, display, display), ...commaSeg(trailing)] });
+      return true;
+    }
+    return false;
+  }
+
+  // Open/child-rows/close for an array or object; empty containers stay inline.
+  function pushContainer(
+    entries: Array<[string | null, unknown]>, open: string, close: string,
+    depth: number, key: string | null, trailing: boolean,
+  ): void {
+    if (entries.length === 0) {
+      rows.push({ depth, segs: [...keySeg(key), textSeg(open + close), ...commaSeg(trailing)] });
       return;
     }
+    rows.push({ depth, segs: [...keySeg(key), textSeg(open)] });
+    for (let i = 0; i < entries.length; i++) {
+      walk(entries[i][1], depth + 1, entries[i][0], i < entries.length - 1);
+    }
+    rows.push({ depth, segs: [textSeg(close), ...commaSeg(trailing)] });
+  }
+
+  function walk(v: unknown, depth: number, key: string | null, trailing: boolean): void {
+    if (rows.length >= MAX_JSON_ROWS) { capped = true; return; }
+    if (pushScalar(v, depth, key, trailing)) return;
     if (Array.isArray(v)) {
-      if (v.length === 0) {
-        rows.push({ depth, segs: [...keySeg(key), textSeg('[]'), ...commaSeg(trailing)] });
-        return;
-      }
-      rows.push({ depth, segs: [...keySeg(key), textSeg('[')] });
-      for (let i = 0; i < v.length; i++) walk(v[i], depth + 1, null, i < v.length - 1);
-      rows.push({ depth, segs: [textSeg(']'), ...commaSeg(trailing)] });
+      pushContainer(v.map(item => [null, item]), '[', ']', depth, key, trailing);
       return;
     }
-    if (t === 'object') {
+    if (typeof v === 'object') {
       const obj = v as Record<string, unknown>;
-      const keys = Object.keys(obj);
-      if (keys.length === 0) {
-        rows.push({ depth, segs: [...keySeg(key), textSeg('{}'), ...commaSeg(trailing)] });
-        return;
-      }
-      rows.push({ depth, segs: [...keySeg(key), textSeg('{')] });
-      for (let i = 0; i < keys.length; i++) walk(obj[keys[i]], depth + 1, keys[i], i < keys.length - 1);
-      rows.push({ depth, segs: [textSeg('}'), ...commaSeg(trailing)] });
+      pushContainer(Object.keys(obj).map(k => [k, obj[k]]), '{', '}', depth, key, trailing);
       return;
     }
+    // Anything left (functions, symbols, undefined) — render whatever JSON can.
     try {
       const fallback = JSON.stringify(v);
       if (fallback !== undefined) rows.push({ depth, segs: [...keySeg(key), textSeg(escHtml(fallback)), ...commaSeg(trailing)] });
@@ -1023,20 +1042,28 @@ function normalizeNumber(s: string): string {
   return Number.isFinite(n) ? String(n) : '';
 }
 
-function findMultipleValuesInDom(queries: Array<{value: string; kind: string}>): HTMLElement[] {
-  if (queries.length === 0) return [];
-  const termSeen = new Set<string>();
-  const terms: Array<{lower: string; value: string; kind: string; numNorm: string}> = [];
-  for (const q of queries) {
-    const key = `${q.kind}:${q.value}`;
-    if (termSeen.has(key)) continue;
-    termSeen.add(key);
-    terms.push({ lower: q.value.toLowerCase(), value: q.value, kind: q.kind, numNorm: q.kind === 'number' ? normalizeNumber(q.value) : '' });
+interface SearchTerm { lower: string; value: string; kind: string; numNorm: string }
+
+function makeSearchTerm(value: string, kind: string): SearchTerm {
+  return {
+    lower: value.toLowerCase(), value, kind,
+    numNorm: kind === 'number' ? normalizeNumber(value) : '',
+  };
+}
+
+// Numbers match on normalized numeric value; strings match whole-text (either
+// case) or, once long enough to be unambiguous, as a substring.
+function textMatchesTerm(text: string, textLower: string, term: SearchTerm): boolean {
+  if (term.kind === 'number') {
+    return term.numNorm !== '' && normalizeNumber(text) === term.numNorm;
   }
-  if (terms.length === 0) return [];
-  const results: HTMLElement[] = [];
-  const seenEls = new Set<HTMLElement>();
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+  return text === term.value || textLower === term.lower
+    || (term.value.length >= MIN_SUBSTRING_LEN && textLower.includes(term.lower));
+}
+
+// Text nodes worth searching: skips the overlay's own DOM and non-rendered tags.
+function createPageTextWalker(): TreeWalker {
+  return document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       const parent = node.parentElement;
       if (!parent || isOverlayOwned(parent)) return NodeFilter.FILTER_REJECT;
@@ -1045,28 +1072,73 @@ function findMultipleValuesInDom(queries: Array<{value: string; kind: string}>):
       return NodeFilter.FILTER_ACCEPT;
     }
   });
+}
+
+function findMultipleValuesInDom(queries: Array<{value: string; kind: string}>): HTMLElement[] {
+  if (queries.length === 0) return [];
+  const termSeen = new Set<string>();
+  const terms: SearchTerm[] = [];
+  for (const q of queries) {
+    const key = `${q.kind}:${q.value}`;
+    if (termSeen.has(key)) continue;
+    termSeen.add(key);
+    terms.push(makeSearchTerm(q.value, q.kind));
+  }
+  if (terms.length === 0) return [];
+
+  const results: HTMLElement[] = [];
+  const seenEls = new Set<HTMLElement>();
+  const walker = createPageTextWalker();
   for (let node = walker.nextNode(); node && results.length < MAX_VALUE_HIGHLIGHTS; node = walker.nextNode()) {
     const text = (node.nodeValue ?? '').trim();
     if (!text) continue;
     const textLower = text.toLowerCase();
-    for (const term of terms) {
-      let hit = false;
-      if (term.kind === 'number') {
-        if (term.numNorm && normalizeNumber(text) === term.numNorm) hit = true;
-      } else if (
-        text === term.value || textLower === term.lower
-        || (term.value.length >= MIN_SUBSTRING_LEN && textLower.includes(term.lower))
-      ) {
-        hit = true;
-      }
-      if (hit) {
-        const parent = (node as Text).parentElement;
-        if (parent && !seenEls.has(parent)) { seenEls.add(parent); results.push(parent); }
-        break;
-      }
-    }
+    if (!terms.some(term => textMatchesTerm(text, textLower, term))) continue;
+    const parent = (node as Text).parentElement;
+    if (parent && !seenEls.has(parent)) { seenEls.add(parent); results.push(parent); }
   }
   return results;
+}
+
+// Each scan takes a `collect` sink that returns false once the result cap is
+// reached, so a scan can stop early exactly as the original inline loops did.
+type CollectFn = (el: HTMLElement | null) => boolean;
+
+function scanTextNodes(term: SearchTerm, collect: CollectFn): void {
+  const walker = createPageTextWalker();
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const text = (node.nodeValue ?? '').trim();
+    if (!text) continue;
+    if (!textMatchesTerm(text, text.toLowerCase(), term)) continue;
+    if (!collect((node as Text).parentElement)) break;
+  }
+}
+
+function scanInputValues(term: SearchTerm, collect: CollectFn): void {
+  const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('input, textarea');
+  for (const el of inputs) {
+    const v = (el.value ?? '').trim();
+    if (!v) continue;
+    const matches = v === term.value
+      || (term.value.length >= MIN_SUBSTRING_LEN && v.toLowerCase().includes(term.lower));
+    if (matches && !collect(el)) break;
+  }
+}
+
+function scanUrlAttributes(term: SearchTerm, collect: CollectFn): void {
+  const urlEls = document.querySelectorAll<HTMLElement>('img[src], a[href], source[src], video[src], audio[src], iframe[src]');
+  for (const el of urlEls) {
+    const src = el.getAttribute('src') ?? el.getAttribute('href') ?? '';
+    if (!src) continue;
+    const matches = src === term.value || src.endsWith(term.value)
+      || (term.value.length >= MIN_SUBSTRING_LEN && src.includes(term.value));
+    if (matches && !collect(el)) break;
+  }
+}
+
+function isUrlLikeValue(value: string, kind: string): boolean {
+  return kind === 'string'
+    && (/^https?:\/\//i.test(value) || value.startsWith('/') || value.startsWith('data:'));
 }
 
 function findValuesInDom(value: string, kind: string): HTMLElement[] {
@@ -1077,56 +1149,21 @@ function findValuesInDom(value: string, kind: string): HTMLElement[] {
   // counts (e.g. "5 Branches") are unambiguous and exempt from the length floor
   // that suppresses noisy short-string matches.
   if (kind !== 'number' && trimmed.length < MIN_VALUE_LEN) return [];
+
   const results: HTMLElement[] = [];
   const seen = new Set<HTMLElement>();
-  const collect = (el: HTMLElement | null): boolean => {
+  const collect: CollectFn = el => {
     if (!el || seen.has(el) || isOverlayOwned(el)) return true;
     seen.add(el);
     results.push(el);
     return results.length < MAX_VALUE_HIGHLIGHTS;
   };
-  const lower = trimmed.toLowerCase();
-  const numNorm = kind === 'number' ? normalizeNumber(trimmed) : '';
-  const isUrlLike = kind === 'string' && (/^https?:\/\//i.test(trimmed) || trimmed.startsWith('/') || trimmed.startsWith('data:'));
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-    acceptNode(node) {
-      const parent = node.parentElement;
-      if (!parent || isOverlayOwned(parent)) return NodeFilter.FILTER_REJECT;
-      const tag = parent.tagName;
-      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
-      return NodeFilter.FILTER_ACCEPT;
-    }
-  });
-  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    const text = (node.nodeValue ?? '').trim();
-    if (!text) continue;
-    let hit = false;
-    if (kind === 'number') {
-      if (numNorm && normalizeNumber(text) === numNorm) hit = true;
-    } else if (text === trimmed || text.toLowerCase() === lower) {
-      hit = true;
-    } else if (trimmed.length >= MIN_SUBSTRING_LEN && text.toLowerCase().includes(lower)) {
-      hit = true;
-    }
-    if (hit && !collect((node as Text).parentElement)) break;
-  }
-  if (kind === 'string' && results.length < MAX_VALUE_HIGHLIGHTS) {
-    const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('input, textarea');
-    for (const el of inputs) {
-      const v = (el.value ?? '').trim();
-      if (!v) continue;
-      const matches = v === trimmed || (trimmed.length >= MIN_SUBSTRING_LEN && v.toLowerCase().includes(lower));
-      if (matches && !collect(el)) break;
-    }
-  }
-  if (isUrlLike && results.length < MAX_VALUE_HIGHLIGHTS) {
-    const urlEls = document.querySelectorAll<HTMLElement>('img[src], a[href], source[src], video[src], audio[src], iframe[src]');
-    for (const el of urlEls) {
-      const src = el.getAttribute('src') ?? el.getAttribute('href') ?? '';
-      if (!src) continue;
-      const matches = src === trimmed || src.endsWith(trimmed) || (trimmed.length >= MIN_SUBSTRING_LEN && src.includes(trimmed));
-      if (matches && !collect(el)) break;
-    }
+  const term = makeSearchTerm(trimmed, kind);
+
+  scanTextNodes(term, collect);
+  if (kind === 'string' && results.length < MAX_VALUE_HIGHLIGHTS) scanInputValues(term, collect);
+  if (isUrlLikeValue(trimmed, kind) && results.length < MAX_VALUE_HIGHLIGHTS) {
+    scanUrlAttributes(term, collect);
   }
   return results;
 }
@@ -1317,63 +1354,74 @@ function detailPanelHtml(req: ApiRequest): string {
     <button class="ov-copy-btn" data-url="${encodeURIComponent(req.url || '')}">copy curl</button>
   </div>`;
 
-  let paneHtml = '';
+  return `<div class="ov-detail">${tabsHtml}${detailPaneHtml(req, activeTab)}</div>`;
+}
 
-  if (activeTab === 'response') {
-    let resBodyHtml: string;
-    if (req.resBody != null) {
-      const parsed = parseJsonBody(req.resBody);
-      const truncNote = parsed?.truncated
-        ? '<div class="ov-trunc-note">⚠ response truncated — showing recovered partial body</div>'
-        : '';
-      resBodyHtml = parsed !== undefined
-        ? `${truncNote}<div class="ov-body-json" data-id="${req.id}"></div>`
-        : `<pre class="ov-body-pre">${escHtml(formatBody(req.resBody).slice(0, 3000))}</pre>`;
-    } else if (req.status === 'pending') {
-      resBodyHtml = '<div class="ov-body-none">Waiting…</div>';
-    } else {
-      resBodyHtml = '<div class="ov-body-none">No response body</div>';
-    }
-    paneHtml = `<div class="ov-panel">${resBodyHtml}</div>`;
+function detailPaneHtml(req: ApiRequest, activeTab: DetailTab): string {
+  switch (activeTab) {
+    case 'response': return `<div class="ov-panel">${responseBodyHtml(req)}</div>`;
+    case 'request':  return `<div class="ov-panel">${requestBodyHtml(req)}</div>`;
+    case 'headers':  return headersPaneHtml(req);
+    case 'timing':   return timingPaneHtml(req);
+    case 'frames':   return framesPaneHtml(req);
+    default:         return '';
+  }
+}
 
-  } else if (activeTab === 'request') {
-    paneHtml = req.reqBody
-      ? `<div class="ov-panel"><pre class="ov-body-pre">${escHtml(formatBody(req.reqBody).slice(0, 3000))}</pre></div>`
-      : `<div class="ov-panel"><div class="ov-body-none">No request body</div></div>`;
+function responseBodyHtml(req: ApiRequest): string {
+  if (req.resBody == null) {
+    return req.status === 'pending'
+      ? '<div class="ov-body-none">Waiting…</div>'
+      : '<div class="ov-body-none">No response body</div>';
+  }
+  const parsed = parseJsonBody(req.resBody);
+  if (parsed === undefined) {
+    return `<pre class="ov-body-pre">${escHtml(formatBody(req.resBody).slice(0, 3000))}</pre>`;
+  }
+  const truncNote = parsed.truncated
+    ? '<div class="ov-trunc-note">⚠ response truncated — showing recovered partial body</div>'
+    : '';
+  // The tree itself is mounted by the virtualizer once the row is in the DOM.
+  return `${truncNote}<div class="ov-body-json" data-id="${req.id}"></div>`;
+}
 
-  } else if (activeTab === 'headers') {
-    paneHtml = `<div class="ov-panel">
+function requestBodyHtml(req: ApiRequest): string {
+  return req.reqBody
+    ? `<pre class="ov-body-pre">${escHtml(formatBody(req.reqBody).slice(0, 3000))}</pre>`
+    : '<div class="ov-body-none">No request body</div>';
+}
+
+function headersPaneHtml(req: ApiRequest): string {
+  return `<div class="ov-panel">
       <div class="ov-detail-label" style="margin-bottom:4px">Request</div>
       ${headerRowsHtml('', req.reqHeaders)}
       <div class="ov-detail-label" style="margin:10px 0 4px">Response</div>
       ${headerRowsHtml('', req.resHeaders)}
     </div>`;
+}
 
-  } else if (activeTab === 'timing') {
-    const total = req.ms ?? 0;
-    const ttfb = Math.max(0, total - TIMING_DNS_MS - TIMING_TCP_MS - TIMING_DL_MS);
-    paneHtml = `<div class="ov-panel"><div class="ov-kv">
+function timingPaneHtml(req: ApiRequest): string {
+  const total = req.ms ?? 0;
+  const ttfb = Math.max(0, total - TIMING_DNS_MS - TIMING_TCP_MS - TIMING_DL_MS);
+  return `<div class="ov-panel"><div class="ov-kv">
       <div class="ov-kv-k">DNS</div><div class="ov-kv-v">${TIMING_DNS_MS}ms</div>
       <div class="ov-kv-k">TCP</div><div class="ov-kv-v">${TIMING_TCP_MS}ms</div>
       <div class="ov-kv-k">TTFB</div><div class="ov-kv-v">${ttfb}ms</div>
       <div class="ov-kv-k">Download</div><div class="ov-kv-v">${TIMING_DL_MS}ms</div>
       <div class="ov-kv-k">Total</div><div class="ov-kv-v">${total}ms</div>
     </div></div>`;
+}
 
-  } else if (activeTab === 'frames') {
-    const msgs = req.messages ?? [];
-    paneHtml = `<div class="ov-panel"><div class="ov-ws-thread">${
-      msgs.length === 0
-        ? '<div class="ov-body-none">No messages yet</div>'
-        : msgs.slice(-100).map(m => `<div class="ov-ws-msg ov-ws-${m.dir}">
+function framesPaneHtml(req: ApiRequest): string {
+  const msgs = req.messages ?? [];
+  const body = msgs.length === 0
+    ? '<div class="ov-body-none">No messages yet</div>'
+    : msgs.slice(-100).map(m => `<div class="ov-ws-msg ov-ws-${m.dir}">
             <span class="ov-ws-dir">${m.dir === 'sent' ? 'send ▶' : '◀ recv'}</span>
             <span class="ov-ws-t">+${m.ts}ms</span>
             <pre class="ov-ws-body">${escHtml(m.body.slice(0, 500))}</pre>
-          </div>`).join('')
-    }</div></div>`;
-  }
-
-  return `<div class="ov-detail">${tabsHtml}${paneHtml}</div>`;
+          </div>`).join('');
+  return `<div class="ov-panel"><div class="ov-ws-thread">${body}</div></div>`;
 }
 
 // '—' when the request never completed, ms under a second, otherwise seconds.
@@ -1460,112 +1508,122 @@ function renderFooter(): void {
 
 // ── Main render ───────────────────────────────────────────────────────────────
 
+// Cap regex search input length per field. A pathological pattern (e.g. /(a+)+$/)
+// on a 50KB body will hang the page; truncation bounds the worst case to a slice.
+const REGEX_MAX_INPUT = 8000;
+
+// The search box compiled into a predicate. `invalid` drives the red outline on
+// the input when a regex fails to compile.
+interface TextMatcher { test: (r: ApiRequest) => boolean; invalid: boolean }
+
+function regexMatchesRequest(r: ApiRequest, regex: RegExp): boolean {
+  const clip = (str: string): string => str.length > REGEX_MAX_INPUT ? str.slice(0, REGEX_MAX_INPUT) : str;
+  return regex.test(clip(r.url || ''))
+      || (r.reqBody != null && regex.test(clip(r.reqBody)))
+      || (r.resBody != null && regex.test(clip(r.resBody)));
+}
+
+function buildTextMatcher(rawFilter: string): TextMatcher {
+  const filterText = caseSensitiveSearch ? rawFilter : rawFilter.toLowerCase();
+  if (!filterText) return { test: () => true, invalid: false };
+
+  if (regexSearch) {
+    let regex: RegExp;
+    try { regex = new RegExp(rawFilter, caseSensitiveSearch ? '' : 'i'); }
+    catch { return { test: () => false, invalid: true }; }
+    return { test: r => regexMatchesRequest(r, regex), invalid: false };
+  }
+  if (caseSensitiveSearch) {
+    return {
+      invalid: false,
+      test: r => (r.url || '').includes(filterText)
+        || (r.reqBody?.includes(filterText) ?? false)
+        || (r.resBody?.includes(filterText) ?? false),
+    };
+  }
+  return {
+    invalid: false,
+    test: r => (r._lcUrl ?? '').includes(filterText)
+      || (r._lcReqBody?.includes(filterText) ?? false)
+      || (r._lcResBody?.includes(filterText) ?? false),
+  };
+}
+
+// AND semantics: 'err' + 'slow' both selected ⇒ only slow errors.
+function matchesFlags(r: ApiRequest): boolean {
+  if (activeFlags.size === 0) return true;
+  if (activeFlags.has('err')  && !isError(r)) return false;
+  if (activeFlags.has('slow') && (r.ms ?? 0) <= 800) return false;
+  return true;
+}
+
+// Every chip/flag filter except the text box. An empty set means "no constraint".
+function matchesChipFilters(r: ApiRequest): boolean {
+  if (activeMethods.size > 0 && !activeMethods.has((r.method || 'GET').toUpperCase())) return false;
+  if (activeStatus.size > 0 && !activeStatus.has(statusBucket(r))) return false;
+  if (activeInitiators.size > 0 && !activeInitiators.has(r.element ? 'page' : 'bg')) return false;
+  return matchesFlags(r);
+}
+
+// Newest first, stopping at RENDER_LIMIT so a huge log can't stall the render.
+function selectVisibleRequests(snapshot: ApiRequest[], matcher: TextMatcher): ApiRequest[] {
+  const visible: ApiRequest[] = [];
+  for (let i = snapshot.length - 1; i >= 0 && visible.length < RENDER_LIMIT; i--) {
+    const r = snapshot[i];
+    if (!matchesChipFilters(r)) continue;
+    if (!matcher.test(r)) continue;
+    visible.push(r);
+  }
+  return visible;
+}
+
+function listEmptyStateHtml(): string {
+  const body = requests.size === 0
+    ? 'No API calls captured yet.<br><small>Interact with the page to see calls appear here.</small>'
+    : 'No results match your filter.';
+  return `<div class="ov-empty">${body}</div>`;
+}
+
+function renderCspBlocked(list: HTMLElement, countEl: HTMLElement | null): void {
+  list.innerHTML = `<div class="ov-empty" style="color:var(--ov-s-err)">
+      Capture script failed to load.<br><small>Likely blocked by the page's Content-Security-Policy.</small>
+    </div>`;
+  if (countEl) countEl.textContent = '0';
+  renderFooter();
+}
+
+// Mount a virtualizer for every visible JSON response placeholder.
+function mountVisibleJsonTrees(list: HTMLElement): void {
+  for (const host of list.querySelectorAll<HTMLElement>('.ov-body-json[data-id]')) {
+    const id = Number(host.dataset.id);
+    const req = requests.get(id);
+    if (!req?.resBody) continue;
+    const parsed = tryParseJsonContainer(req.resBody);
+    if (parsed === undefined) continue;
+    jvVirtMounts.set(host, mountJsonVirtualizer(host, flattenJsonRows(parsed), id));
+  }
+}
+
 function renderList(): void {
   if (!activated) return;
-
   if (dockState === 'pill') { refreshPill(); return; }
 
   const list = $('ov-list');
   const countEl = $('ov-count');
   if (!list) return;
+  if (cspBlocked) { renderCspBlocked(list, countEl); return; }
 
-  if (cspBlocked) {
-    list.innerHTML = `<div class="ov-empty" style="color:var(--ov-s-err)">
-      Capture script failed to load.<br><small>Likely blocked by the page's Content-Security-Policy.</small>
-    </div>`;
-    if (countEl) countEl.textContent = '0';
-    renderFooter();
-    return;
-  }
-
-  const rawFilter = filterInput?.value ?? '';
-  const filterText = caseSensitiveSearch ? rawFilter : rawFilter.toLowerCase();
-
-  let regex: RegExp | null = null;
-  let regexInvalid = false;
-  if (regexSearch && rawFilter) {
-    try { regex = new RegExp(rawFilter, caseSensitiveSearch ? '' : 'i'); }
-    catch { regexInvalid = true; }
-  }
-  filterInput?.classList.toggle('ov-filter-invalid', regexInvalid);
-
-  // Cap regex search input length per field. A pathological pattern (e.g. /(a+)+$/)
-  // on a 50KB body will hang the page; truncation bounds the worst case to a slice.
-  const REGEX_MAX_INPUT = 8000;
-  function matchesText(r: ApiRequest): boolean {
-    if (!filterText) return true;
-    if (regexInvalid) return false;
-    if (regex) {
-      const clip = (s: string): string => s.length > REGEX_MAX_INPUT ? s.slice(0, REGEX_MAX_INPUT) : s;
-      return regex.test(clip(r.url || ''))
-          || (r.reqBody != null && regex.test(clip(r.reqBody)))
-          || (r.resBody != null && regex.test(clip(r.resBody)));
-    }
-    if (caseSensitiveSearch) {
-      return (r.url || '').includes(filterText)
-          || (r.reqBody?.includes(filterText) ?? false)
-          || (r.resBody?.includes(filterText) ?? false);
-    }
-    return (r._lcUrl ?? '').includes(filterText)
-        || (r._lcReqBody?.includes(filterText) ?? false)
-        || (r._lcResBody?.includes(filterText) ?? false);
-  }
-
-  function matchesStatus(r: ApiRequest): boolean {
-    if (activeStatus.size === 0) return true;
-    const b = statusBucket(r);
-    return activeStatus.has(b);
-  }
-
-  function matchesMethod(r: ApiRequest): boolean {
-    if (activeMethods.size === 0) return true;
-    return activeMethods.has((r.method || 'GET').toUpperCase());
-  }
-
-  function matchesInitiator(r: ApiRequest): boolean {
-    if (activeInitiators.size === 0) return true;
-    const ini = r.element ? 'page' : 'bg';
-    return activeInitiators.has(ini);
-  }
-
-  // AND semantics: 'err' + 'slow' both selected ⇒ only slow errors.
-  function matchesFlags(r: ApiRequest): boolean {
-    if (activeFlags.size === 0) return true;
-    if (activeFlags.has('err')  && !isError(r)) return false;
-    if (activeFlags.has('slow') && (r.ms ?? 0) <= 800) return false;
-    return true;
-  }
+  const matcher = buildTextMatcher(filterInput?.value ?? '');
+  filterInput?.classList.toggle('ov-filter-invalid', matcher.invalid);
 
   const snapshot = Array.from(requests.values());
-  const visible: ApiRequest[] = [];
-  for (let i = snapshot.length - 1; i >= 0 && visible.length < RENDER_LIMIT; i--) {
-    const r = snapshot[i];
-    if (!matchesMethod(r)) continue;
-    if (!matchesStatus(r)) continue;
-    if (!matchesInitiator(r)) continue;
-    if (!matchesFlags(r)) continue;
-    if (!matchesText(r)) continue;
-    visible.push(r);
-  }
+  const visible = selectVisibleRequests(snapshot, matcher);
 
   if (countEl) countEl.textContent = `${visible.length}/${requests.size}`;
-
-  // update chip counts
   updateChipCounts(snapshot);
 
-  let html = '';
-
-  if (showPinTray) html += renderPinTray();
-
-  if (visible.length === 0) {
-    html += `<div class="ov-empty">${
-      requests.size === 0
-        ? 'No API calls captured yet.<br><small>Interact with the page to see calls appear here.</small>'
-        : 'No results match your filter.'
-    }</div>`;
-  } else {
-    html += visible.map(r => rowHtml(r)).join('');
-  }
+  let html = showPinTray ? renderPinTray() : '';
+  html += visible.length === 0 ? listEmptyStateHtml() : visible.map(r => rowHtml(r)).join('');
 
   // Snapshot scroll positions of currently mounted JSON virtualizers, then tear
   // them down — innerHTML below will detach their DOM hosts.
@@ -1573,17 +1631,7 @@ function renderList(): void {
   destroyAllJvVirt();
 
   list.innerHTML = html;
-
-  // Mount a virtualizer for every visible JSON response placeholder.
-  for (const host of list.querySelectorAll<HTMLElement>('.ov-body-json[data-id]')) {
-    const id = Number(host.dataset.id);
-    const req = requests.get(id);
-    if (!req?.resBody) continue;
-    const parsed = tryParseJsonContainer(req.resBody);
-    if (parsed === undefined) continue;
-    const rows = flattenJsonRows(parsed);
-    jvVirtMounts.set(host, mountJsonVirtualizer(host, rows, id));
-  }
+  mountVisibleJsonTrees(list);
 
   reattachValueHighlight();
   reattachRevHighlight();
@@ -1643,121 +1691,123 @@ function bindListDelegation(list: HTMLElement): void {
     clearHighlight();
   });
 
-  list.addEventListener('click', (e: Event) => {
-    const target = e.target as Element;
+  list.addEventListener('click', onListClick);
+}
 
-    const pinBtn = target.closest<HTMLElement>('.ov-pin-btn');
-    if (pinBtn) {
-      e.stopPropagation();
-      const id = Number(pinBtn.dataset.id);
-      if (!Number.isFinite(id)) return;
-      const req = requests.get(id);
-      if (!req) return;
-      if (pinnedIds.has(id)) {
-        pinnedIds.delete(id);
-        pinnedKeys.delete(pinKey(req));
-      } else {
-        pinnedIds.add(id);
-        pinnedKeys.add(pinKey(req));
-      }
-      chrome.storage.local.set({ ovPinnedKeys: [...pinnedKeys] });
-      scheduleRender();
-      return;
-    }
+// Flash a transient label on a copy button, then restore it.
+function flashCopyLabel(btn: HTMLElement, label: string): void {
+  btn.textContent = label;
+  setTimeout(() => { btn.textContent = 'copy'; }, 900);
+}
 
-    const copyTabBtn = target.closest<HTMLElement>('.ov-copy-tab-btn');
-    if (copyTabBtn) {
-      e.stopPropagation();
-      const id = Number(copyTabBtn.dataset.id);
-      if (!Number.isFinite(id)) return;
-      const tab = copyTabBtn.dataset.tab as DetailTab;
-      const req = requests.get(id);
-      let text = '';
-      if (req) {
-        if (tab === 'response') {
-          text = req.resBody ?? '';
-        } else if (tab === 'request') {
-          text = req.reqBody ?? '';
-        } else if (tab === 'headers') {
-          const fmt = (pairs: HeaderPair[] | null | undefined) =>
-            (pairs ?? []).map(([n, v]) => `${n}: ${v}`).join('\n');
-          text = `-- Request --\n${fmt(req.reqHeaders)}\n\n-- Response --\n${fmt(req.resHeaders)}`;
-        } else if (tab === 'timing') {
-          const total = req.ms ?? 0;
-          const ttfb = Math.max(0, total - TIMING_DNS_MS - TIMING_TCP_MS - TIMING_DL_MS);
-          text = `DNS: ${TIMING_DNS_MS}ms\nTCP: ${TIMING_TCP_MS}ms\nTTFB: ${ttfb}ms\nDownload: ${TIMING_DL_MS}ms\nTotal: ${total}ms`;
-        } else if (tab === 'frames') {
-          text = (req.messages ?? []).slice(-100).map(m => `[${m.dir} +${m.ts}ms] ${m.body}`).join('\n');
-        }
-      }
-      const restore = (label: string) => {
-        copyTabBtn.textContent = label;
-        setTimeout(() => { copyTabBtn.textContent = 'copy'; }, 900);
-      };
-      if (navigator.clipboard?.writeText) {
-        navigator.clipboard.writeText(text).then(() => restore('copied!'), () => restore('failed'));
-      } else {
-        restore('failed');
-      }
-      return;
-    }
+function copyToClipboard(btn: HTMLElement, text: string, okLabel: string): void {
+  if (!navigator.clipboard?.writeText) { flashCopyLabel(btn, 'failed'); return; }
+  navigator.clipboard.writeText(text).then(
+    () => flashCopyLabel(btn, okLabel),
+    () => flashCopyLabel(btn, 'failed'),
+  );
+}
 
-    const copyBtn = target.closest<HTMLElement>('.ov-copy-btn');
-    if (copyBtn) {
-      e.stopPropagation();
-      const url = safeDecodeURIComponent(copyBtn.dataset.url ?? '');
-      const restore = (label: string) => {
-        copyBtn.textContent = label;
-        setTimeout(() => { copyBtn.textContent = 'copy'; }, 900);
-      };
-      if (navigator.clipboard?.writeText) {
-        navigator.clipboard.writeText(url).then(() => restore('copied'), () => restore('failed'));
-      } else {
-        restore('failed');
-      }
-      return;
+// Plain-text rendering of one detail tab, for the per-tab copy button.
+function detailTabText(req: ApiRequest, tab: DetailTab): string {
+  switch (tab) {
+    case 'response': return req.resBody ?? '';
+    case 'request':  return req.reqBody ?? '';
+    case 'headers': {
+      const fmt = (pairs: HeaderPair[] | null | undefined) =>
+        (pairs ?? []).map(([n, v]) => `${n}: ${v}`).join('\n');
+      return `-- Request --\n${fmt(req.reqHeaders)}\n\n-- Response --\n${fmt(req.resHeaders)}`;
     }
+    case 'timing': {
+      const total = req.ms ?? 0;
+      const ttfb = Math.max(0, total - TIMING_DNS_MS - TIMING_TCP_MS - TIMING_DL_MS);
+      return `DNS: ${TIMING_DNS_MS}ms\nTCP: ${TIMING_TCP_MS}ms\nTTFB: ${ttfb}ms\nDownload: ${TIMING_DL_MS}ms\nTotal: ${total}ms`;
+    }
+    case 'frames':
+      return (req.messages ?? []).slice(-100).map(m => `[${m.dir} +${m.ts}ms] ${m.body}`).join('\n');
+    default: return '';
+  }
+}
 
-    const tabBtn = target.closest<HTMLElement>('.ov-tab');
-    if (tabBtn) {
-      e.stopPropagation();
-      const wrap = tabBtn.parentElement;
-      const id = Number(wrap?.dataset.id);
-      const tab = tabBtn.dataset.tab as DetailTab | undefined;
-      if (!Number.isFinite(id) || !tab) return;
-      detailTabs.set(id, tab);
-      clearBulkHighlights();
-      if (tab === 'response') runBulkHighlight(id);
-      scheduleRender();
-      return;
-    }
+function togglePin(pinBtn: HTMLElement): void {
+  const id = Number(pinBtn.dataset.id);
+  if (!Number.isFinite(id)) return;
+  const req = requests.get(id);
+  if (!req) return;
+  if (pinnedIds.has(id)) {
+    pinnedIds.delete(id);
+    pinnedKeys.delete(pinKey(req));
+  } else {
+    pinnedIds.add(id);
+    pinnedKeys.add(pinKey(req));
+  }
+  chrome.storage.local.set({ ovPinnedKeys: [...pinnedKeys] });
+  scheduleRender();
+}
 
-    const jv = target.closest<HTMLElement>('.ov-jv');
-    if (jv) {
-      e.stopPropagation();
-      handleJsonValueClick(jv);
-      return;
-    }
+function switchDetailTab(tabBtn: HTMLElement): void {
+  const id = Number(tabBtn.parentElement?.dataset.id);
+  const tab = tabBtn.dataset.tab as DetailTab | undefined;
+  if (!Number.isFinite(id) || !tab) return;
+  detailTabs.set(id, tab);
+  clearBulkHighlights();
+  if (tab === 'response') runBulkHighlight(id);
+  scheduleRender();
+}
 
-    const row = target.closest<HTMLElement>('.ov-row');
-    if (!row) return;
-    // The detail panel is rendered inside .ov-row, so a click on its body (not on
-    // a tab/copy/value control handled above) would otherwise bubble here and
-    // collapse the row. Only the summary header toggles expansion.
-    if (target.closest('.ov-detail')) return;
-    const id = Number(row.dataset.id);
-    if (expandedIds.has(id)) {
-      expandedIds.delete(id);
-      detailTabs.delete(id);
-      if (valueHighlightKey.startsWith(`${id}|`)) clearValueHighlights();
-      if (bulkHighlightRowId === id) clearBulkHighlights();
-    } else {
-      expandedIds.add(id);
-      const activeTab = detailTabs.get(id) ?? 'response';
-      if (activeTab === 'response') runBulkHighlight(id);
-    }
-    scheduleRender();
-  });
+function toggleRowExpansion(row: HTMLElement): void {
+  const id = Number(row.dataset.id);
+  if (expandedIds.has(id)) {
+    expandedIds.delete(id);
+    detailTabs.delete(id);
+    if (valueHighlightKey.startsWith(`${id}|`)) clearValueHighlights();
+    if (bulkHighlightRowId === id) clearBulkHighlights();
+  } else {
+    expandedIds.add(id);
+    if ((detailTabs.get(id) ?? 'response') === 'response') runBulkHighlight(id);
+  }
+  scheduleRender();
+}
+
+// Controls are checked before the row itself, and each stops propagation, so a
+// click on a control never also toggles the row underneath it.
+function onListClick(e: Event): void {
+  const target = e.target as Element;
+
+  const pinBtn = target.closest<HTMLElement>('.ov-pin-btn');
+  if (pinBtn) { e.stopPropagation(); togglePin(pinBtn); return; }
+
+  const copyTabBtn = target.closest<HTMLElement>('.ov-copy-tab-btn');
+  if (copyTabBtn) {
+    e.stopPropagation();
+    const id = Number(copyTabBtn.dataset.id);
+    if (!Number.isFinite(id)) return;
+    const req = requests.get(id);
+    const text = req ? detailTabText(req, copyTabBtn.dataset.tab as DetailTab) : '';
+    copyToClipboard(copyTabBtn, text, 'copied!');
+    return;
+  }
+
+  const copyBtn = target.closest<HTMLElement>('.ov-copy-btn');
+  if (copyBtn) {
+    e.stopPropagation();
+    copyToClipboard(copyBtn, safeDecodeURIComponent(copyBtn.dataset.url ?? ''), 'copied');
+    return;
+  }
+
+  const tabBtn = target.closest<HTMLElement>('.ov-tab');
+  if (tabBtn) { e.stopPropagation(); switchDetailTab(tabBtn); return; }
+
+  const jv = target.closest<HTMLElement>('.ov-jv');
+  if (jv) { e.stopPropagation(); handleJsonValueClick(jv); return; }
+
+  const row = target.closest<HTMLElement>('.ov-row');
+  if (!row) return;
+  // The detail panel is rendered inside .ov-row, so a click on its body (not on
+  // a tab/copy/value control handled above) would otherwise bubble here and
+  // collapse the row. Only the summary header toggles expansion.
+  if (target.closest('.ov-detail')) return;
+  toggleRowExpansion(row);
 }
 
 function bindChipDelegation(container: HTMLElement): void {
@@ -1805,6 +1855,48 @@ function bindFooterDelegation(container: HTMLElement): void {
 
 // ── Pill (collapsed state) ────────────────────────────────────────────────────
 
+// Expand to the panel, carrying the pill's position over so it grows in place.
+function dockAsPanel(panel: HTMLElement | null, pill: HTMLElement | null): void {
+  const pillRect = pill?.getBoundingClientRect();
+  $('ov-pill')?.remove();
+  if (!panelVisible) {
+    panelVisible = true;
+    chrome.storage.local.set({ ovVisible: true });
+  }
+  if (pillRect) {
+    // Panel may be display:none here, so getBoundingClientRect can return 0×0.
+    // Fall through to defaults rather than persisting a zero-size geometry.
+    const measured = panel?.getBoundingClientRect();
+    const w = savedPanelGeom?.width ?? (measured && measured.width > 0 ? measured.width : DEFAULT_PANEL_WIDTH);
+    const h = savedPanelGeom?.height ?? (measured && measured.height > 0 ? measured.height : DEFAULT_PANEL_HEIGHT);
+    savedPanelGeom = { left: pillRect.left, top: pillRect.top, width: w, height: h };
+    chrome.storage.local.set({ ovPanelGeom: savedPanelGeom });
+  }
+  if (!panel) {
+    buildPanel();
+    return;
+  }
+  applySavedGeometry(panel);
+  panel.style.setProperty('display', 'flex', 'important');
+  renderList();
+}
+
+// Collapse to the pill, carrying the panel's position over so it shrinks in place.
+function dockAsPill(panel: HTMLElement | null, pill: HTMLElement | null): void {
+  if (panel) {
+    const r = panel.getBoundingClientRect();
+    savedPillGeom = { left: r.left, top: r.top };
+    chrome.storage.local.set({ ovPillGeom: savedPillGeom });
+    panel.style.setProperty('display', 'none', 'important');
+  }
+  if (!pill) {
+    buildPill();
+    return;
+  }
+  applySavedGeometry(pill);
+  refreshPill();
+}
+
 function setDockState(next: DockState): void {
   if (next === dockState) return;
   dockState = next;
@@ -1812,39 +1904,9 @@ function setDockState(next: DockState): void {
   const panel = $('ov-panel');
   const pill = $('ov-pill');
   if (next === 'panel') {
-    // Carry the pill's current position over to the panel so it expands in place.
-    const pillRect = pill?.getBoundingClientRect();
-    $('ov-pill')?.remove();
-    if (!panelVisible) {
-      panelVisible = true;
-      chrome.storage.local.set({ ovVisible: true });
-    }
-    if (pillRect) {
-      // Panel may be display:none here, so getBoundingClientRect can return 0×0.
-      // Fall through to defaults rather than persisting a zero-size geometry.
-      const measured = panel?.getBoundingClientRect();
-      const w = savedPanelGeom?.width ?? (measured && measured.width > 0 ? measured.width : DEFAULT_PANEL_WIDTH);
-      const h = savedPanelGeom?.height ?? (measured && measured.height > 0 ? measured.height : DEFAULT_PANEL_HEIGHT);
-      savedPanelGeom = { left: pillRect.left, top: pillRect.top, width: w, height: h };
-      chrome.storage.local.set({ ovPanelGeom: savedPanelGeom });
-    }
-    if (!panel) {
-      buildPanel();
-    } else {
-      applySavedGeometry(panel);
-      panel.style.setProperty('display', 'flex', 'important');
-      renderList();
-    }
+    dockAsPanel(panel, pill);
   } else if (next === 'pill') {
-    // Carry the panel's current position over to the pill so it collapses in place.
-    if (panel) {
-      const r = panel.getBoundingClientRect();
-      savedPillGeom = { left: r.left, top: r.top };
-      chrome.storage.local.set({ ovPillGeom: savedPillGeom });
-      panel.style.setProperty('display', 'none', 'important');
-    }
-    if (!pill) buildPill();
-    else { applySavedGeometry(pill); refreshPill(); }
+    dockAsPill(panel, pill);
   } else {
     if (panel) panel.style.setProperty('display', 'none', 'important');
     $('ov-pill')?.remove();
@@ -2132,23 +2194,48 @@ function clampBadgeLeftIntoView(badge: HTMLElement): void {
   badge.style.left = `${Math.max(minLeft, Math.min(anchor, maxLeft))}px`;
 }
 
+// Single endpoint — show inline, no circle, no popup.
+function renderSingleBadge(badge: HTMLElement, id: number): void {
+  const r = requests.get(id);
+  if (!r) return;
+  badge.className = 'ov-float-badge ov-fb-single';
+  badge.dataset.theme = currentTheme;
+  badge.classList.remove('ov-fb-open');
+  badge.innerHTML = clusterBadgeRowHtml(r);
+  clampBadgeLeftIntoView(badge);
+}
+
+// First render, or an upgrade from the single layout — build from scratch.
+function buildClusterBadge(badge: HTMLElement, ids: number[], open: boolean): void {
+  const popupHtml = ids.map(id => {
+    const r = requests.get(id);
+    return r ? clusterBadgeRowHtml(r) : '';
+  }).join('');
+  const dir = badge.dataset.popupDir ?? 'right';
+  badge.innerHTML = `<span class="ov-fb-circle">${ids.length}</span>`
+    + `<div class="ov-fb-popup ov-fb-popup-${dir}${open ? ' ov-fb-popup-show' : ''}">${popupHtml}</div>`;
+}
+
+// Add/update rows in place without touching unaffected ones, so an open popup
+// isn't torn down underneath the pointer.
+function syncClusterRows(popupEl: HTMLElement, ids: number[]): void {
+  const existingRows = Array.from(popupEl.querySelectorAll<HTMLElement>('.ov-fb-row'));
+  for (let i = 0; i < ids.length; i++) {
+    const r = requests.get(ids[i]);
+    if (!r) continue;
+    if (existingRows[i]) existingRows[i].outerHTML = clusterBadgeRowHtml(r);
+    else popupEl.insertAdjacentHTML('beforeend', clusterBadgeRowHtml(r));
+  }
+  const staleRows = Array.from(popupEl.querySelectorAll<HTMLElement>('.ov-fb-row')).slice(ids.length);
+  for (const el of staleRows) el.remove();
+}
+
 function refreshClusterBadge(sel: string): void {
   const badge = selectorBadges.get(sel);
   if (!badge) return;
   const ids = selectorReqIds.get(sel) ?? [];
-  const count = ids.length;
 
-  if (count === 1) {
-    // Single endpoint — show inline, no circle, no popup
-    const r = requests.get(ids[0]);
-    if (!r) return;
-    badge.className = 'ov-float-badge ov-fb-single';
-    badge.dataset.theme = currentTheme;
-    badge.classList.remove('ov-fb-open');
-    badge.innerHTML = clusterBadgeRowHtml(r);
-    clampBadgeLeftIntoView(badge);
-    return;
-  }
+  if (ids.length === 1) { renderSingleBadge(badge, ids[0]); return; }
 
   // Multi-endpoint cluster — upgrade class if coming from single mode
   if (!badge.classList.contains('ov-fb-cluster')) {
@@ -2162,36 +2249,11 @@ function refreshClusterBadge(sel: string): void {
   const open = badge.classList.contains('ov-fb-open');
   const countEl = badge.querySelector<HTMLElement>('.ov-fb-circle');
   const popupEl = badge.querySelector<HTMLElement>('.ov-fb-popup');
+  if (!countEl || !popupEl) { buildClusterBadge(badge, ids, open); return; }
 
-  if (!countEl || !popupEl) {
-    // First render or upgrade from single — build from scratch
-    const popupHtml = ids.map(id => {
-      const r = requests.get(id);
-      return r ? clusterBadgeRowHtml(r) : '';
-    }).join('');
-    const dir = badge.dataset.popupDir ?? 'right';
-    badge.innerHTML = `<span class="ov-fb-circle">${count}</span><div class="ov-fb-popup ov-fb-popup-${dir}${open ? ' ov-fb-popup-show' : ''}">${popupHtml}</div>`;
-    return;
-  }
-
-  // Surgical updates — avoid full rebuild while popup may be open
-  countEl.textContent = String(count);
+  countEl.textContent = String(ids.length);
   popupEl.classList.toggle('ov-fb-popup-show', open);
-
-  // Sync rows: add/update without touching unaffected ones
-  const existingRows = Array.from(popupEl.querySelectorAll<HTMLElement>('.ov-fb-row'));
-  for (let i = 0; i < ids.length; i++) {
-    const r = requests.get(ids[i]);
-    if (!r) continue;
-    if (existingRows[i]) {
-      existingRows[i].outerHTML = clusterBadgeRowHtml(r);
-    } else {
-      popupEl.insertAdjacentHTML('beforeend', clusterBadgeRowHtml(r));
-    }
-  }
-  // Remove stale trailing rows
-  const staleRows = Array.from(popupEl.querySelectorAll<HTMLElement>('.ov-fb-row')).slice(ids.length);
-  for (const el of staleRows) el.remove();
+  syncClusterRows(popupEl, ids);
 }
 
 function navigateToRequest(id: number): void {
@@ -3507,6 +3569,44 @@ function injectHook(): void {
   (document.head || document.documentElement).prepend(script);
 }
 
+// The activation chain, flattened into named steps: theme → stored state →
+// preserved log → surface. Each step is top-level so the callbacks don't nest.
+
+function restoreFilters(saved: unknown): void {
+  if (!saved) return;
+  const f = saved as { status?: string[]; methods?: string[]; initiators?: string[]; flags?: string[] };
+  if (f.status) for (const s of f.status) activeStatus.add(s);
+  if (f.methods) for (const m of f.methods) activeMethods.add(m);
+  if (f.initiators) for (const i of f.initiators) activeInitiators.add(i);
+  if (f.flags) for (const fl of f.flags) activeFlags.add(fl);
+}
+
+function buildOverlaySurface(): void {
+  if (dockState === 'pill') buildPill();
+  else buildPanel();
+  // Replay anything captured before the UI existed (load-time requests).
+  drainPreActivationBuffer();
+}
+
+function applyStoredOverlayState(result: Record<string, unknown>): void {
+  dockState = (result.ovDockState as DockState) || 'panel';
+  if (Array.isArray(result.ovPinnedKeys)) {
+    for (const k of result.ovPinnedKeys) pinnedKeys.add(k);
+  }
+  restoreFilters(result.ovFilters);
+  savedPanelGeom = isValidPanelGeom(result.ovPanelGeom) ? result.ovPanelGeom : null;
+  savedPillGeom = isValidPillGeom(result.ovPillGeom) ? result.ovPillGeom : null;
+  hydrateFromPreserved(buildOverlaySurface);
+}
+
+function applyLoadedTheme(theme: 'dark' | 'light'): void {
+  currentTheme = theme;
+  chrome.storage.local.get(
+    ['ovDockState', 'ovPinnedKeys', 'ovFilters', 'ovPanelGeom', 'ovPillGeom'],
+    applyStoredOverlayState,
+  );
+}
+
 function activateOverlay(): void {
   if (activated) return;
   activated = true;
@@ -3517,30 +3617,7 @@ function activateOverlay(): void {
 
   const init = () => {
     loadFont().then(({ family, size }) => applyFont(family, size));
-    loadTheme().then(theme => {
-      currentTheme = theme;
-      chrome.storage.local.get(['ovDockState', 'ovPinnedKeys', 'ovFilters', 'ovPanelGeom', 'ovPillGeom'], result => {
-        dockState = (result.ovDockState as DockState) || 'panel';
-        if (Array.isArray(result.ovPinnedKeys)) {
-          for (const k of result.ovPinnedKeys) pinnedKeys.add(k);
-        }
-        if (result.ovFilters) {
-          const f = result.ovFilters as { status?: string[]; methods?: string[]; initiators?: string[]; flags?: string[] };
-          if (f.status) for (const s of f.status) activeStatus.add(s);
-          if (f.methods) for (const m of f.methods) activeMethods.add(m);
-          if (f.initiators) for (const i of f.initiators) activeInitiators.add(i);
-          if (f.flags) for (const fl of f.flags) activeFlags.add(fl);
-        }
-        savedPanelGeom = isValidPanelGeom(result.ovPanelGeom) ? result.ovPanelGeom : null;
-        savedPillGeom = isValidPillGeom(result.ovPillGeom) ? result.ovPillGeom : null;
-        hydrateFromPreserved(() => {
-          if (dockState === 'pill') buildPill();
-          else buildPanel();
-          // Replay anything captured before the UI existed (load-time requests).
-          drainPreActivationBuffer();
-        });
-      });
-    });
+    loadTheme().then(applyLoadedTheme);
   };
 
   clusterOutsideClickHandler = (e: MouseEvent) => {
