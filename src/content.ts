@@ -92,6 +92,18 @@ const activeMethods = new Set<string>();
 const activeInitiators = new Set<string>();
 const activeFlags = new Set<string>();   // 'err' | 'slow' — derived footer filters
 
+// Same-origin target for the page ↔ injected-hook channel. Opaque origins
+// (file://, sandboxed frames) serialize as the string "null", which is not a
+// valid targetOrigin and makes postMessage throw, so fall back to '*' there.
+// Kept in sync with TARGET_ORIGIN in src/injected.ts.
+const TARGET_ORIGIN = location.origin && location.origin !== 'null' ? location.origin : '*';
+
+// Reading chrome.runtime.lastError is what suppresses the "Unchecked
+// runtime.lastError" console warning; the value itself is never needed.
+function swallowLastError(): void {
+  if (chrome.runtime.lastError) { /* intentionally ignored */ }
+}
+
 // pin state
 const pinnedIds = new Set<number>();
 const pinnedKeys = new Set<string>(); // `${method}|${urlNoQuery}`
@@ -223,7 +235,7 @@ function flushPreserve(): void {
       { action: 'ov-preserve', reqs, wsDeltas },
       // Read lastError to silence the "Unchecked runtime.lastError" warning when
       // the SW is briefly unavailable (cold start, eviction, or unload race).
-      () => void chrome.runtime.lastError,
+      swallowLastError,
     );
   } catch {
     // chrome.runtime.sendMessage throws when the extension context has been
@@ -239,7 +251,7 @@ function clearPreserved(): void {
   try {
     chrome.runtime.sendMessage(
       { action: 'ov-clear-preserved' },
-      () => void chrome.runtime.lastError,
+      swallowLastError,
     );
   } catch { /* see flushPreserve */ }
 }
@@ -247,7 +259,7 @@ function clearPreserved(): void {
 function hydrateFromPreserved(onDone: () => void): void {
   try {
     chrome.runtime.sendMessage({ action: 'ov-get-preserved' }, (resp: { ok?: boolean; reqs?: ApiRequest[] } | undefined) => {
-      void chrome.runtime.lastError;
+      swallowLastError();
       const list = resp?.reqs;
       if (Array.isArray(list) && list.length) {
         // Sort by capture time so the restored slice keeps chronological order
@@ -305,7 +317,7 @@ function trimRequests(): void {
   const overflow = requests.size - MAX_REQUESTS;
   const iter = requests.keys();
   for (let i = 0; i < overflow; i++) {
-    const k = iter.next().value as number | undefined;
+    const k = iter.next().value;
     if (k === undefined) break;
     const trimmed = requests.get(k);
     requests.delete(k);
@@ -408,6 +420,7 @@ function handleOverlayMessage(msg: OverlayMessage): void {
 
 window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
   if (e.source !== window) return;
+  if (TARGET_ORIGIN !== '*' && e.origin !== TARGET_ORIGIN) return;
   if (!e.data?.__apiOverlay) return;
   const msg = e.data;
   // Before activation there is no UI; hold captured requests so they can be
@@ -621,7 +634,7 @@ function formatBody(text: string | null | undefined): string {
   return text;
 }
 
-function tryParseJsonContainer(text: string | null | undefined): unknown | undefined {
+function tryParseJsonContainer(text: string | null | undefined): unknown {
   return parseJsonBody(text)?.value;
 }
 
@@ -644,7 +657,7 @@ function parseJsonBody(text: string | null | undefined): { value: unknown; trunc
 // unfinished string is kept as far as it was read, an unfinished object/array
 // drops only its incomplete trailing element, and an unfinished value is
 // discarded. Used only as a fallback for truncated bodies.
-function parsePartialJson(src: string): unknown | undefined {
+function parsePartialJson(src: string): unknown {
   let i = 0;
   const n = src.length;
   const EOF = Symbol('eof');
@@ -704,13 +717,13 @@ function parsePartialJson(src: string): unknown | undefined {
     return Number.isNaN(num) ? EOF : num;
   }
 
-  function parseKeyword(word: string, value: unknown): unknown | typeof EOF {
+  function parseKeyword(word: string, value: unknown): unknown {
     if (!src.startsWith(word, i)) return EOF;
     i += word.length;
     return value;
   }
 
-  function parseValue(): unknown | typeof EOF {
+  function parseValue(): unknown {
     skipWs();
     if (i >= n) return EOF;
     const ch = src[i];
@@ -817,7 +830,7 @@ function collectJsonLeaves(root: unknown, out: Array<{value: string; kind: strin
       if (!seen.has(s)) { seen.add(s); out.push({ value: s, kind: 'number' }); }
       return;
     }
-    if (Array.isArray(value)) { for (const item of value) walk(item); return; }
+    if (Array.isArray(value)) { for (const item of value) { walk(item); } return; }
     if (t === 'object') { for (const v of Object.values(value as Record<string, unknown>)) walk(v); }
   }
   walk(root);
@@ -900,7 +913,7 @@ function jsonRowToHtml(row: JsonRow, activeKey: string): string {
   for (const seg of row.segs) {
     if (seg.kind === 'text') { out += seg.html; continue; }
     const enc = encodeURIComponent(seg.raw);
-    const isActive = activeKey && activeKey.endsWith(`|${seg.vkind}|${enc}`);
+    const isActive = activeKey?.endsWith(`|${seg.vkind}|${enc}`);
     out += `<span class="ov-jv ov-jv-${seg.vkind}${isActive ? ' ov-jv-active' : ''}" data-ov-val="${enc}" data-ov-kind="${seg.vkind}">${seg.display}</span>`;
   }
   return out;
@@ -1004,7 +1017,7 @@ function mountJsonVirtualizer(host: HTMLElement, rows: JsonRow[], reqId: number)
 // ── DOM value search / highlight ──────────────────────────────────────────────
 
 function normalizeNumber(s: string): string {
-  const m = s.replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
+  const m = /-?\d+(?:\.\d+)?/.exec(s.replace(/,/g, ''));
   if (!m) return '';
   const n = Number(m[0]);
   return Number.isFinite(n) ? String(n) : '';
@@ -1033,16 +1046,18 @@ function findMultipleValuesInDom(queries: Array<{value: string; kind: string}>):
     }
   });
   for (let node = walker.nextNode(); node && results.length < MAX_VALUE_HIGHLIGHTS; node = walker.nextNode()) {
-    const text = (node.nodeValue || '').trim();
+    const text = (node.nodeValue ?? '').trim();
     if (!text) continue;
     const textLower = text.toLowerCase();
     for (const term of terms) {
       let hit = false;
       if (term.kind === 'number') {
         if (term.numNorm && normalizeNumber(text) === term.numNorm) hit = true;
-      } else {
-        if (text === term.value || textLower === term.lower) hit = true;
-        else if (term.value.length >= MIN_SUBSTRING_LEN && textLower.includes(term.lower)) hit = true;
+      } else if (
+        text === term.value || textLower === term.lower
+        || (term.value.length >= MIN_SUBSTRING_LEN && textLower.includes(term.lower))
+      ) {
+        hit = true;
       }
       if (hit) {
         const parent = (node as Text).parentElement;
@@ -1083,7 +1098,7 @@ function findValuesInDom(value: string, kind: string): HTMLElement[] {
     }
   });
   for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    const text = (node.nodeValue || '').trim();
+    const text = (node.nodeValue ?? '').trim();
     if (!text) continue;
     let hit = false;
     if (kind === 'number') {
@@ -1097,9 +1112,8 @@ function findValuesInDom(value: string, kind: string): HTMLElement[] {
   }
   if (kind === 'string' && results.length < MAX_VALUE_HIGHLIGHTS) {
     const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('input, textarea');
-    for (let i = 0; i < inputs.length; i++) {
-      const el = inputs[i];
-      const v = (el.value || '').trim();
+    for (const el of inputs) {
+      const v = (el.value ?? '').trim();
       if (!v) continue;
       const matches = v === trimmed || (trimmed.length >= MIN_SUBSTRING_LEN && v.toLowerCase().includes(lower));
       if (matches && !collect(el)) break;
@@ -1107,9 +1121,8 @@ function findValuesInDom(value: string, kind: string): HTMLElement[] {
   }
   if (isUrlLike && results.length < MAX_VALUE_HIGHLIGHTS) {
     const urlEls = document.querySelectorAll<HTMLElement>('img[src], a[href], source[src], video[src], audio[src], iframe[src]');
-    for (let i = 0; i < urlEls.length; i++) {
-      const el = urlEls[i];
-      const src = el.getAttribute('src') || el.getAttribute('href') || '';
+    for (const el of urlEls) {
+      const src = el.getAttribute('src') ?? el.getAttribute('href') ?? '';
       if (!src) continue;
       const matches = src === trimmed || src.endsWith(trimmed) || (trimmed.length >= MIN_SUBSTRING_LEN && src.includes(trimmed));
       if (matches && !collect(el)) break;
@@ -1160,9 +1173,9 @@ function clearJvHover(): void {
 // walks the DOM and the pointer can sweep across many .ov-jv spans.
 function runJvHover(jv: HTMLElement): void {
   const row = jv.closest<HTMLElement>('.ov-row');
-  const rowId = row?.dataset.id || '';
-  const encVal = jv.dataset.ovVal || '';
-  const kind = jv.dataset.ovKind || 'string';
+  const rowId = row?.dataset.id ?? '';
+  const encVal = jv.dataset.ovVal ?? '';
+  const kind = jv.dataset.ovKind ?? 'string';
   const key = `${rowId}|${kind}|${encVal}`;
   if (key === jvHoverKey) return;            // already previewing this value
   clearJvHover();
@@ -1213,9 +1226,9 @@ function handleJsonValueClick(jv: HTMLElement): void {
   clearJvHover();
   clearBulkHighlights();
   const row = jv.closest<HTMLElement>('.ov-row');
-  const rowId = row?.dataset.id || '';
-  const encVal = jv.dataset.ovVal || '';
-  const kind = jv.dataset.ovKind || 'string';
+  const rowId = row?.dataset.id ?? '';
+  const encVal = jv.dataset.ovVal ?? '';
+  const kind = jv.dataset.ovKind ?? 'string';
   const key = `${rowId}|${kind}|${encVal}`;
   const value = safeDecodeURIComponent(encVal);
   if (key === valueHighlightKey && valueHighlightEls.length > 1) {
@@ -1363,6 +1376,13 @@ function detailPanelHtml(req: ApiRequest): string {
   return `<div class="ov-detail">${tabsHtml}${paneHtml}</div>`;
 }
 
+// '—' when the request never completed, ms under a second, otherwise seconds.
+function formatDuration(ms: number | undefined): string {
+  if (ms == null) return '—';
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(2)}s`;
+}
+
 function rowHtml(req: ApiRequest): string {
   const bucket = statusBucket(req);
   const statusLabel = req.status === 'pending' ? '•••' : String(req.status);
@@ -1372,15 +1392,13 @@ function rowHtml(req: ApiRequest): string {
   const isPinned = pinnedIds.has(req.id);
   const shortUrl = middleTruncate(urlPath(req.url), 72);
 
-  const durLabel = req.ms == null ? '—'
-    : req.ms < 1000 ? `${req.ms}ms`
-    : `${(req.ms / 1000).toFixed(2)}s`;
+  const durLabel = formatDuration(req.ms);
 
   const wsFr = req.kind === 'ws' && req.messages?.length
     ? `<span class="ov-fr">${req.messages.length}fr</span>` : '';
 
   return `<div class="ov-row${isExpanded ? ' ov-expanded' : ''}${isPinned ? ' ov-pinned' : ''}"
-      data-id="${req.id}" data-sel="${encodeURIComponent(req.element?.selector || '')}"
+      data-id="${req.id}" data-sel="${encodeURIComponent(req.element?.selector ?? '')}"
       title="${escHtml(req.url)}${req.element?.label ? ' — ' + escHtml(req.element.label) : ''}">
     <div class="ov-c ov-c-method m-${safeMethodClass(method)}">${escHtml(method)}</div>
     <div class="ov-c ov-c-status s-${bucket}">${statusLabel}</div>
@@ -1460,7 +1478,7 @@ function renderList(): void {
     return;
   }
 
-  const rawFilter = filterInput?.value || '';
+  const rawFilter = filterInput?.value ?? '';
   const filterText = caseSensitiveSearch ? rawFilter : rawFilter.toLowerCase();
 
   let regex: RegExp | null = null;
@@ -1485,12 +1503,12 @@ function renderList(): void {
     }
     if (caseSensitiveSearch) {
       return (r.url || '').includes(filterText)
-          || (r.reqBody != null && r.reqBody.includes(filterText))
-          || (r.resBody != null && r.resBody.includes(filterText));
+          || (r.reqBody?.includes(filterText) ?? false)
+          || (r.resBody?.includes(filterText) ?? false);
     }
-    return (r._lcUrl || '').includes(filterText)
-        || (r._lcReqBody != null && r._lcReqBody.includes(filterText))
-        || (r._lcResBody != null && r._lcResBody.includes(filterText));
+    return (r._lcUrl ?? '').includes(filterText)
+        || (r._lcReqBody?.includes(filterText) ?? false)
+        || (r._lcResBody?.includes(filterText) ?? false);
   }
 
   function matchesStatus(r: ApiRequest): boolean {
@@ -1579,7 +1597,7 @@ function updateChipCounts(snapshot: ApiRequest[]): void {
     if (b in counts) counts[b]++;
   }
   for (const chip of document.querySelectorAll<HTMLElement>('.ov-chip[data-s]')) {
-    const s = chip.dataset.s || '';
+    const s = chip.dataset.s ?? '';
     const badge = chip.querySelector('.ov-chip-count');
     if (badge) badge.textContent = String(counts[s] ?? 0);
   }
@@ -1606,7 +1624,7 @@ function bindListDelegation(list: HTMLElement): void {
     if (!row || !list.contains(row)) return;
     const related = (e as MouseEvent).relatedTarget as Element | null;
     if (related && row.contains(related)) return;
-    const sel = safeDecodeURIComponent(row.dataset.sel || '');
+    const sel = safeDecodeURIComponent(row.dataset.sel ?? '');
     if (sel) highlightEl(sel);
   });
 
@@ -1687,7 +1705,7 @@ function bindListDelegation(list: HTMLElement): void {
     const copyBtn = target.closest<HTMLElement>('.ov-copy-btn');
     if (copyBtn) {
       e.stopPropagation();
-      const url = safeDecodeURIComponent(copyBtn.dataset.url || '');
+      const url = safeDecodeURIComponent(copyBtn.dataset.url ?? '');
       const restore = (label: string) => {
         copyBtn.textContent = label;
         setTimeout(() => { copyBtn.textContent = 'copy'; }, 900);
@@ -1703,7 +1721,7 @@ function bindListDelegation(list: HTMLElement): void {
     const tabBtn = target.closest<HTMLElement>('.ov-tab');
     if (tabBtn) {
       e.stopPropagation();
-      const wrap = tabBtn.parentElement as HTMLElement | null;
+      const wrap = tabBtn.parentElement;
       const id = Number(wrap?.dataset.id);
       const tab = tabBtn.dataset.tab as DetailTab | undefined;
       if (!Number.isFinite(id) || !tab) return;
@@ -1833,16 +1851,21 @@ function setDockState(next: DockState): void {
   }
 }
 
+// Colour class for one tick in the pill's recent-request rail.
+function pillTickClass(r: ApiRequest): string {
+  const b = statusBucket(r);
+  if (b === '4xx' || b === '5xx' || b === 'err') return 'err';
+  if (b === '3xx') return 'warn';
+  return r.kind === 'ws' ? 'ws' : '';
+}
+
 function pillInnerHtml(): string {
   const reqs = [...requests.values()];
   const total = reqs.length;
   const errs = reqs.filter(isError).length;
   const recent = reqs.slice(-12);
   const ticks = recent.map(r => {
-    const b = statusBucket(r);
-    const cls = b === '4xx' || b === '5xx' || b === 'err' ? 'err'
-              : b === '3xx' ? 'warn'
-              : r.kind === 'ws' ? 'ws' : '';
+    const cls = pillTickClass(r);
     return `<span class="ov-pill-tick${cls ? ' ' + cls : ''}"></span>`;
   }).join('');
   return `
@@ -2018,7 +2041,7 @@ function exportHAR(): void {
     .filter(r => r.kind !== 'ws' && typeof r.status === 'number')
     .map(r => ({
       startedDateTime: new Date(r.ts || Date.now()).toISOString(),
-      time: r.ms || 0,
+      time: r.ms ?? 0,
       request: {
         method: r.method || 'GET', url: r.url || '', httpVersion: 'HTTP/1.1',
         headers: toHarHeaders(r.reqHeaders), queryString: parseQuery(r.url),
@@ -2028,11 +2051,11 @@ function exportHAR(): void {
       response: {
         status: r.status as number, statusText: '', httpVersion: 'HTTP/1.1',
         headers: toHarHeaders(r.resHeaders), cookies: [],
-        content: { size: byteLen(r.resBody), mimeType: detectMime(r.resBody), text: r.resBody || '' },
+        content: { size: byteLen(r.resBody), mimeType: detectMime(r.resBody), text: r.resBody ?? '' },
         redirectURL: '', headersSize: -1, bodySize: byteLen(r.resBody)
       },
       cache: {},
-      timings: { send: 0, wait: r.ms || 0, receive: 0 }
+      timings: { send: 0, wait: r.ms ?? 0, receive: 0 }
     }));
 
   const har = { log: { version: '1.2', creator: { name: 'CalloutAPI', version: '1.0' }, pages: [], entries } };
@@ -2370,7 +2393,7 @@ function clearAllBadges(): void {
 // ── Drag / resize ─────────────────────────────────────────────────────────────
 
 function signalInjected(action: 'pause' | 'resume' | 'stop' | 'start'): void {
-  window.postMessage({ __apiOverlayControl: true, action }, '*');
+  window.postMessage({ __apiOverlayControl: true, action }, TARGET_ORIGIN);
 }
 
 function isValidPanelGeom(v: unknown): v is PanelGeom {
@@ -2428,6 +2451,18 @@ function persistGeometry(el: HTMLElement): void {
   }
 }
 
+// Both the drag and the resize gesture end the same way: unbind the transient
+// document listeners and persist the new geometry. Shared so the two closures
+// aren't byte-identical duplicates.
+function makeGestureEnd(panel: HTMLElement, move: (ev: MouseEvent) => void): () => void {
+  const up = (): void => {
+    document.removeEventListener('mousemove', move);
+    document.removeEventListener('mouseup', up);
+    persistGeometry(panel);
+  };
+  return up;
+}
+
 function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
   let ox = 0, oy = 0;
   handle.addEventListener('mousedown', (e: MouseEvent) => {
@@ -2451,11 +2486,7 @@ function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
       panel.style.setProperty('right', 'auto', 'important');
       panel.style.setProperty('bottom', 'auto', 'important');
     };
-    const up = () => {
-      document.removeEventListener('mousemove', move);
-      document.removeEventListener('mouseup', up);
-      persistGeometry(panel);
-    };
+    const up = makeGestureEnd(panel, move);
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
   });
@@ -2489,11 +2520,7 @@ function makeResizable(panel: HTMLElement): void {
       panel.style.setProperty('width', `${w}px`, 'important');
       panel.style.setProperty('height', `${h}px`, 'important');
     };
-    const up = () => {
-      document.removeEventListener('mousemove', move);
-      document.removeEventListener('mouseup', up);
-      persistGeometry(panel);
-    };
+    const up = makeGestureEnd(panel, move);
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
   });
