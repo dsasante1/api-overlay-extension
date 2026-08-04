@@ -25,6 +25,7 @@ interface PreservedRequest {
   resHeaders?: Array<[string, string]> | null;
   messages?: BgWsMessage[];
   ms?: number;
+  pageUrl?: string;
 }
 
 const BG_MAX_REQUESTS_PER_TAB = 1000;
@@ -118,7 +119,92 @@ async function handleClear(tabId: number): Promise<void> {
   }
 }
 
+// ── Site-map background scan ─────────────────────────────────────────────────
+//
+// Loads one page in an inactive tab so that tab's content script can capture the
+// calls it really makes, then harvests the result and closes it. This is the only
+// part of the site map that navigates anywhere, which is why it runs one page at
+// a time and only when the user clicks "scan" on that page.
+
+const SM_SCAN_LOAD_TIMEOUT_MS = 20_000;
+const SM_SCAN_SETTLE_MS = 2_500;
+
+// Normalized origin+pathname of the scan currently in flight. The scanned tab's
+// content script asks whether it matches and, if so, suppresses its overlay.
+// Keyed by URL rather than tab id because the content script runs at
+// document_start — before chrome.tabs.create() has resolved with an id.
+const smPendingScanUrls = new Set<string>();
+let smScanInFlight = false;
+
+function smNormUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return '';
+  }
+}
+
+function smWaitForLoad(tabId: number): Promise<void> {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      clearTimeout(timer);
+      resolve();
+    };
+    const onUpdated = (id: number, info: chrome.tabs.TabChangeInfo): void => {
+      if (id === tabId && info.status === 'complete') finish();
+    };
+    const timer = setTimeout(finish, SM_SCAN_LOAD_TIMEOUT_MS);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    // The page may already have finished loading before the listener attached.
+    chrome.tabs.get(tabId)
+      .then(t => { if (t.status === 'complete') finish(); })
+      .catch(() => finish());
+  });
+}
+
+async function smHandleScan(url: string): Promise<PreservedRequest[]> {
+  const norm = smNormUrl(url);
+  if (!norm || smScanInFlight) return [];
+  smScanInFlight = true;
+  smPendingScanUrls.add(norm);
+
+  let tabId: number | undefined;
+  try {
+    const tab = await chrome.tabs.create({ url, active: false });
+    tabId = tab.id;
+    if (typeof tabId !== 'number') return [];
+    await smWaitForLoad(tabId);
+    // Load-time XHRs fire after 'complete'; give them a moment to land.
+    await new Promise(r => setTimeout(r, SM_SCAN_SETTLE_MS));
+    // Harvest *before* the tab is removed — onRemoved wipes its store.
+    const store = await getTabStore(tabId);
+    return Array.from(store.values());
+  } catch {
+    return [];
+  } finally {
+    smPendingScanUrls.delete(norm);
+    smScanInFlight = false;
+    if (typeof tabId === 'number') {
+      preservedByTab.delete(tabId);
+      try { await chrome.storage.session.remove(storageKey(tabId)); } catch { /* see persistTabStore */ }
+      try { await chrome.tabs.remove(tabId); } catch { /* already closed */ }
+    }
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Asked before the overlay decides whether to build any UI, so it has to be
+  // answered even for a frame we have no tab id for.
+  if (msg?.action === 'sm-is-scan-tab') {
+    sendResponse({ scan: smPendingScanUrls.has(smNormUrl(sender.url ?? '')) });
+    return false;
+  }
+
   const tabId = sender.tab?.id;
   if (typeof tabId !== 'number') {
     sendResponse({ ok: false });
@@ -146,6 +232,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       handleClear(tabId)
         .then(() => sendResponse({ ok: true }))
         .catch(() => sendResponse({ ok: false }));
+      return true;
+    }
+    case 'sm-scan': {
+      const url = typeof msg.url === 'string' ? msg.url : '';
+      smHandleScan(url)
+        .then(reqs => sendResponse({ ok: true, reqs }))
+        .catch(() => sendResponse({ ok: false, reqs: [] }));
       return true;
     }
     default:

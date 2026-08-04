@@ -6,234 +6,292 @@
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
-  width: 320px;
-  font-family: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
-  font-size: 11px;
-  --bg:        #0d0e10;
-  --bg-2:      #14161a;
-  --bg-3:      #1a1d22;
-  --border:    #2a2f37;
-  --fg:        #d6dae0;
-  --fg-2:      #9aa1ab;
-  --fg-3:      #6a7180;
-  --fg-mute:   #4a505c;
-  --accent:    #6ab0ff;
-  --accent-bg: rgba(106,176,255,0.14);
-  --s-ok:      #4ec9b0;
-  --s-err:     #ff5a6e;
+  width: 340px;
+  font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  font-size: 12px;
+  --bg:        #0e1116;
+  --bg-2:      #12171e;
+  --bg-3:      #161c24;
+  --hdr:       linear-gradient(#161b22,#12161c);
+  --border:    #232c37;
+  --border-2:  #1b222b;
+  --fg:        #d7dee7;
+  --fg-title:  #eef2f7;
+  --fg-2:      #c3cdd8;
+  --fg-3:      #8a97a6;
+  --fg-mute:   #5b6672;
+  --accent:    #5b8cff;
+  --accent-2:  #8fb0ff;
+  --accent-bg: rgba(91,140,255,0.14);
+  --accent-bd: rgba(91,140,255,0.35);
+  --mark:      linear-gradient(135deg,#5b8cff,#8a5bff);
+  --mark-fg:   #0a0c0f;
+  --s-ok:      #4ec9a5;
+  --s-err:     #e5615e;
+  --mono:      'IBM Plex Mono', 'JetBrains Mono', ui-monospace, monospace;
   background: var(--bg);
   color: var(--fg);
 }
 body[data-theme="light"] {
-  --bg:        #fbfaf7;
-  --bg-2:      #ffffff;
-  --bg-3:      #f3f1ec;
-  --border:    #d9d4c4;
-  --fg:        #1a1c20;
-  --fg-2:      #4a4f59;
-  --fg-3:      #6c727c;
-  --fg-mute:   #9a9fa8;
-  --accent:    #2a6fdb;
-  --accent-bg: rgba(42,111,219,0.12);
-  --s-ok:      #1a8473;
-  --s-err:     #c0273f;
+  --bg:        #ffffff;
+  --bg-2:      #f7f9fb;
+  --bg-3:      #eef1f5;
+  --hdr:       #f3f5f8;
+  --border:    #dce1e8;
+  --border-2:  #e4e8ee;
+  --fg:        #1c2530;
+  --fg-title:  #1c2530;
+  --fg-2:      #3a4552;
+  --fg-3:      #5c6773;
+  --fg-mute:   #98a2ae;
+  --accent:    #2563eb;
+  --accent-2:  #1d4ed8;
+  --accent-bg: rgba(37,99,235,0.10);
+  --accent-bd: rgba(37,99,235,0.35);
+  --mark:      linear-gradient(135deg,#3b6fe0,#7c3aed);
+  --mark-fg:   #ffffff;
+  --s-ok:      #17915f;
+  --s-err:     #d64545;
 }
+
+@keyframes pm-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 
 /* ── Header ── */
 .phead {
   display: flex; align-items: center; gap: 10px;
-  padding: 12px 14px;
-  background: var(--bg-2);
+  padding: 13px 15px;
+  background: var(--hdr);
   border-bottom: 1px solid var(--border);
 }
 .phead .mark {
   width: 22px; height: 22px;
-  background: var(--accent);
-  border-radius: 2px;
+  background: var(--mark);
+  border-radius: 6px;
   display: flex; align-items: center; justify-content: center;
-  color: var(--bg);
-  font-weight: 700; font-size: 11px;
+  color: var(--mark-fg);
+  font-weight: 700; font-size: 12px;
   flex-shrink: 0;
 }
 .phead .title {
-  font-weight: 700; font-size: 11px;
-  letter-spacing: 0.08em; text-transform: uppercase;
+  font-weight: 700; font-size: 14px;
+  color: var(--fg-title);
+  letter-spacing: -0.01em;
   flex: 1;
 }
-.phead .ver { font-size: 9px; color: var(--fg-mute); }
+.phead .ver { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); }
 
 /* ── Sections ── */
 .section {
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--border);
+  padding: 14px 15px;
+  border-bottom: 1px solid var(--border-2);
 }
+.section:last-of-type { border-bottom: none; }
 .sec-head {
   display: flex; align-items: center; justify-content: space-between;
-  font-size: 9px; color: var(--fg-3);
+  font-size: 11px; color: var(--fg-mute);
   letter-spacing: 0.08em; text-transform: uppercase;
   margin-bottom: 10px;
 }
 .badge {
-  font-size: 9px;
-  padding: 1px 5px;
+  font-size: 10px;
+  padding: 2px 7px;
   border: 1px solid var(--border);
-  border-radius: 2px;
-  color: var(--fg-2);
-  letter-spacing: 0.04em;
+  border-radius: 20px;
+  color: var(--fg-3);
+  letter-spacing: 0.02em;
   text-transform: none;
   white-space: nowrap;
 }
 .badge.on {
   color: var(--s-ok);
-  border-color: var(--s-ok);
-  background: rgba(78,201,176,0.08);
+  border-color: rgba(78,201,165,0.35);
+  background: rgba(78,201,165,0.12);
 }
 .badge.off { color: var(--fg-mute); }
 
-/* ── Status line ── */
+/* ── Current site ── */
 .status-line {
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 10px;
-  background: var(--bg-2);
-  border: 1px solid var(--border);
-  border-radius: 2px;
-  margin-bottom: 8px;
+  display: flex; align-items: center; gap: 9px;
+  font-family: var(--mono);
 }
 .status-line .sd {
   width: 8px; height: 8px; border-radius: 50%;
   background: var(--s-ok);
+  animation: pm-pulse 1.6s infinite;
   flex-shrink: 0;
 }
-.status-line.off .sd { background: var(--fg-mute); }
+.status-line.off .sd { background: var(--fg-mute); animation: none; }
 .status-line .host {
-  flex: 1; color: var(--fg);
+  flex: 1; color: var(--fg-title); font-size: 13px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .status-line .state {
-  font-size: 9px; text-transform: uppercase;
-  letter-spacing: 0.08em; color: var(--accent);
+  font-size: 11px; color: var(--s-ok);
   white-space: nowrap;
 }
 .status-line.off .state { color: var(--fg-mute); }
 
 /* ── Buttons ── */
 .fld-label {
-  font-size: 9px; color: var(--fg-3);
+  font-size: 11px; color: var(--fg-mute);
   letter-spacing: 0.08em; text-transform: uppercase;
-  margin: 10px 0 6px;
+  margin: 12px 0 7px;
 }
-.row { display: flex; gap: 6px; margin-bottom: 6px; }
-.row:last-child { margin-bottom: 0; }
+.row { display: flex; gap: 6px; margin-top: 10px; }
 .btn {
   flex: 1;
   background: var(--bg-2);
-  color: var(--fg-2);
+  color: var(--fg-3);
   border: 1px solid var(--border);
-  padding: 7px 10px;
-  border-radius: 2px;
-  font-family: inherit; font-size: 11px;
-  text-align: center;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-family: inherit; font-size: 12px; font-weight: 500;
   display: flex; align-items: center; justify-content: center; gap: 5px;
   cursor: pointer;
-  transition: opacity 0.12s;
+  transition: color .12s, border-color .12s, background .12s;
 }
+.btn:hover { color: var(--fg-2); border-color: var(--fg-mute); }
 .btn.primary {
   background: var(--accent-bg);
-  color: var(--accent);
-  border-color: var(--accent);
+  color: var(--accent-2);
+  border-color: var(--accent-bd);
+  font-weight: 600;
+}
+.btn.danger {
+  background: rgba(229,97,94,0.08);
+  color: var(--s-err);
+  border-color: rgba(229,97,94,0.3);
+  font-weight: 600;
 }
 .btn.dim { color: var(--fg-mute); }
-.btn:hover { opacity: 0.8; }
+
+/* ── Segmented controls ── */
+.pref-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-bottom: 11px;
+}
+.pref-row:last-child { margin-bottom: 0; }
+.pref-label { font-size: 12px; color: var(--fg-2); }
+.segment {
+  display: flex; gap: 2px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2px;
+}
+.segment .btn {
+  flex: none;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 11px;
+  font-size: 11px;
+  color: var(--fg-3);
+}
+.segment .btn:hover { color: var(--fg-2); border-color: transparent; }
+.segment .btn.primary {
+  background: var(--border);
+  color: var(--fg-title);
+  border-color: transparent;
+}
+body[data-theme="light"] .segment .btn.primary { background: #ffffff; box-shadow: 0 1px 2px rgba(20,30,50,.12); }
+.segment .btn.mono { font-family: var(--mono); }
+
+/* ── Size slider ── */
+.size-ctl { display: flex; align-items: center; gap: 9px; }
+.size-ctl .a-sm { font-size: 10px; color: var(--fg-mute); }
+.size-ctl .a-lg { font-size: 16px; color: var(--fg-mute); }
+#size-range {
+  width: 100px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
 
 /* ── Host input ── */
-.input-row { display: flex; gap: 6px; margin-bottom: 8px; }
+.input-row { display: flex; gap: 6px; margin-bottom: 9px; }
 .host-input {
   flex: 1; min-width: 0;
   background: var(--bg-2);
   color: var(--fg);
   border: 1px solid var(--border);
-  padding: 7px 10px;
-  border-radius: 2px;
-  font-family: inherit; font-size: 11px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-family: var(--mono); font-size: 12px;
   outline: none;
 }
 .host-input::placeholder { color: var(--fg-mute); }
-.host-input:focus { border-color: var(--accent); }
+.host-input:focus { border-color: var(--accent-bd); }
 .add-btn {
   background: var(--accent-bg);
-  color: var(--accent);
-  border: 1px solid var(--accent);
-  padding: 7px 12px;
-  border-radius: 2px;
-  font-family: inherit; font-size: 11px;
+  color: var(--accent-2);
+  border: 1px solid var(--accent-bd);
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-family: inherit; font-size: 12px; font-weight: 600;
   cursor: pointer;
   flex-shrink: 0;
 }
+.add-btn:hover { background: rgba(91,140,255,0.22); }
 
 /* ── Host list ── */
-.host-list { display: flex; flex-direction: column; gap: 4px; }
+.host-list { display: flex; flex-direction: column; gap: 6px; }
 .host-item {
   display: flex; align-items: center; gap: 8px;
-  padding: 6px 10px;
+  padding: 7px 10px;
   background: var(--bg-2);
   border: 1px solid var(--border);
-  border-radius: 2px;
-  font-size: 11px;
+  border-radius: 8px;
+  font-family: var(--mono); font-size: 12px;
 }
-.host-item.current {
-  border-color: var(--accent);
-  background: var(--accent-bg);
-}
+.host-item.current { border-color: var(--accent-bd); background: var(--accent-bg); }
+.host-item .host-dot { color: var(--fg-mute); font-size: 10px; flex-shrink: 0; }
+.host-item.current .host-dot { color: var(--s-ok); }
 .host-item .host-name {
-  flex: 1; color: var(--fg);
+  flex: 1; color: var(--fg-2);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.host-item.current .host-name { color: var(--fg-title); }
 .host-item .host-meta {
-  font-size: 9px; color: var(--fg-3);
-  text-transform: uppercase; letter-spacing: 0.06em; white-space: nowrap;
-}
-.host-item .host-now {
-  font-size: 9px; color: var(--accent); white-space: nowrap;
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  font-size: 10px; color: var(--fg-mute); white-space: nowrap;
 }
 .host-item .host-remove {
   background: transparent; border: none;
   color: var(--fg-mute);
-  font-family: inherit; font-size: 15px; line-height: 1;
+  font-family: inherit; font-size: 13px; line-height: 1;
   cursor: pointer; padding: 0 2px;
 }
 .host-item .host-remove:hover { color: var(--s-err); }
 .host-empty {
-  padding: 12px 10px;
+  padding: 14px 10px;
   text-align: center;
   color: var(--fg-mute);
-  font-size: 10px; font-style: italic;
+  font-size: 11px;
   border: 1px dashed var(--border);
-  border-radius: 2px;
+  border-radius: 8px;
+  line-height: 1.5;
 }
 
 /* ── Footer ── */
 .pfooter {
-  padding: 8px 14px;
+  padding: 9px 15px;
   background: var(--bg-2);
-  font-size: 9px; color: var(--fg-3);
+  font-size: 10px; color: var(--fg-mute);
   display: flex; gap: 8px; align-items: center;
   border-top: 1px solid var(--border);
 }
-.pfooter a {
-  color: var(--fg-2);
-  text-decoration: none;
-  border-bottom: 1px dotted var(--fg-mute);
-}
 .pfooter .spacer { flex: 1; }
 .pfooter .pm {
-  display: inline-flex; align-items: center; gap: 4px;
-  color: var(--fg-2);
+  display: inline-flex; align-items: center; gap: 5px;
+  color: var(--fg-3);
+  letter-spacing: 0.06em; text-transform: uppercase;
 }
 .pfooter .pm .d {
   width: 6px; height: 6px; border-radius: 50%;
   background: var(--s-ok);
+  animation: pm-pulse 1.6s infinite;
 }
-.pfooter .pm.idle .d { background: var(--fg-mute); }
+.pfooter .pm.idle .d { background: var(--fg-mute); animation: none; }
 
 /* ── Tooltips ── */
 [data-tip] { position: relative; }
@@ -246,15 +304,16 @@ body[data-theme="light"] {
   background: var(--bg-3);
   color: var(--fg-2);
   border: 1px solid var(--border);
-  border-radius: 2px;
-  padding: 4px 8px;
-  font-size: 9px;
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 10px;
   line-height: 1.5;
   white-space: nowrap;
   pointer-events: none;
   opacity: 0;
   transition: opacity 0.1s;
   z-index: 999;
+  box-shadow: 0 12px 28px -10px rgba(0,0,0,.6);
 }
 [data-tip]::before {
   content: '';
@@ -286,15 +345,15 @@ body[data-theme="light"] {
 
 <!-- Header -->
 <div class="phead">
-  <div class="mark" data-tip="API overlay monitor" data-tip-pos="below">CA</div>
+  <div class="mark" data-tip="API inspection overlay" data-tip-pos="below">C</div>
   <div class="title">CalloutAPI</div>
-  <div class="ver" data-tip="Extension version" data-tip-pos="below" data-tip-align="right">v1.0.1</div>
+  <div class="ver" data-tip="Extension version" data-tip-pos="below" data-tip-align="right">v1.2.2</div>
 </div>
 
-<!-- Current Site -->
+<!-- This site -->
 <div class="section">
   <div class="sec-head">
-    <span>Current site</span>
+    <span>This site</span>
     <span class="badge off" id="status-badge" data-tip="Capture status for this site" data-tip-pos="below" data-tip-align="right">inactive</span>
   </div>
   <div class="status-line off" id="status-line">
@@ -305,31 +364,36 @@ body[data-theme="light"] {
   <!-- Shown when capturing -->
   <div id="capturing-btns" style="display:none">
     <div class="row">
-      <button class="btn primary" id="btn-pause" data-tip="Pause or resume request capturing">⏸ pause</button>
-      <button class="btn" id="btn-toggle" data-tip="Show or hide the overlay panel" data-tip-align="right">👁 hide panel</button>
+      <button type="button" class="btn primary" id="btn-pause" data-tip="Pause or resume request capturing">⏸ pause</button>
+      <button type="button" class="btn" id="btn-toggle" data-tip="Show or hide the overlay workspace" data-tip-align="right">👁 hide panel</button>
     </div>
     <div class="row">
-      <button class="btn dim" id="btn-export" data-tip="Export captured requests as HAR file">↓ export har</button>
-      <button class="btn dim" id="btn-clear" data-tip="Clear all captured requests" data-tip-align="right">✕ clear</button>
+      <button type="button" class="btn dim" id="btn-export" data-tip="Export captured requests as a HAR file">↓ export har</button>
+      <button type="button" class="btn dim" id="btn-clear" data-tip="Clear all captured requests" data-tip-align="right">✕ clear</button>
+    </div>
+    <div class="row">
+      <button type="button" class="btn danger" id="btn-disable" data-tip="Remove this host from the allowlist and tear down immediately">Deactivate on this site</button>
     </div>
   </div>
   <!-- Shown when not capturing -->
   <div id="enable-row">
-    <button class="btn primary" id="btn-enable" style="width:100%" data-tip="Add this site to the allowlist and start capturing">+ enable on this site</button>
+    <div class="row">
+      <button type="button" class="btn primary" id="btn-enable" data-tip="Add this site to the allowlist and start capturing — no reload">+ enable on this site</button>
+    </div>
   </div>
 </div>
 
-<!-- Allowed Sites -->
+<!-- Allowlist -->
 <div class="section">
   <div class="sec-head">
-    <span>Allowed sites (<span id="site-count">0</span>)</span>
+    <span>Allowlist · <span id="site-count">0</span> hosts</span>
     <span class="badge" data-tip="Allowing example.com also covers sub.example.com" data-tip-align="right">subdomains inherit</span>
   </div>
   <div class="input-row">
     <span class="input-wrap" data-tip="Enter a hostname — subdomains inherit automatically">
       <input class="host-input" id="host-input" placeholder="hostname.com" autocomplete="off" spellcheck="false"/>
     </span>
-    <button class="add-btn" id="btn-add-host" data-tip="Add to allowlist" data-tip-align="right">add</button>
+    <button type="button" class="add-btn" id="btn-add-host" data-tip="Add to allowlist" data-tip-align="right">add</button>
   </div>
   <div class="host-list" id="host-list"></div>
 </div>
@@ -337,22 +401,29 @@ body[data-theme="light"] {
 <!-- Appearance -->
 <div class="section">
   <div class="sec-head"><span>Appearance</span></div>
-  <div class="row">
-    <button class="btn primary" id="btn-dark" data-tip="Switch to dark theme">dark</button>
-    <button class="btn" id="btn-light" data-tip="Switch to light theme" data-tip-align="right">light</button>
+  <div class="pref-row">
+    <span class="pref-label">Theme</span>
+    <div class="segment">
+      <button type="button" class="btn primary" id="btn-dark" data-tip="Dark theme">Dark</button>
+      <button type="button" class="btn" id="btn-light" data-tip="Light theme" data-tip-align="right">Light</button>
+    </div>
   </div>
-  <div class="fld-label">Font</div>
-  <div class="row">
-    <button class="btn" id="btn-font-mono" data-tip="Monospace font">mono</button>
-    <button class="btn" id="btn-font-sans" data-tip="Sans-serif font">sans</button>
-    <button class="btn" id="btn-font-serif" data-tip="Serif font" data-tip-align="right">serif</button>
+  <div class="pref-row">
+    <span class="pref-label">Font</span>
+    <div class="segment">
+      <button type="button" class="btn primary mono" id="btn-font-mono" data-tip="Monospace">Mono</button>
+      <button type="button" class="btn" id="btn-font-sans" data-tip="Sans-serif">Sans</button>
+      <button type="button" class="btn" id="btn-font-serif" data-tip="Serif" data-tip-align="right">Serif</button>
+    </div>
   </div>
-  <div class="fld-label">Size</div>
-  <div class="row">
-    <button class="btn" id="btn-size-s" data-tip="Small">S</button>
-    <button class="btn" id="btn-size-m" data-tip="Medium">M</button>
-    <button class="btn" id="btn-size-l" data-tip="Large">L</button>
-    <button class="btn" id="btn-size-xl" data-tip="Extra large" data-tip-align="right">XL</button>
+  <div class="pref-row">
+    <span class="pref-label">Size</span>
+    <div class="size-ctl">
+      <span class="a-sm">A</span>
+      <input type="range" min="0" max="3" step="1" value="1" id="size-range"
+             data-tip="Overlay text size" data-tip-align="right" aria-label="Overlay text size"/>
+      <span class="a-lg">A</span>
+    </div>
   </div>
 </div>
 

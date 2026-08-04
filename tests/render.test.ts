@@ -117,7 +117,7 @@ describe('renderList — filters', () => {
     ov.activeStatus.add('3xx')
     ov.renderList()
     expect(document.querySelector('#ov-list .ov-empty')?.textContent)
-      .toContain('No results match your filter')
+      .toContain('No matches')
   })
 
   it('reports visible/total in the count', () => {
@@ -202,9 +202,14 @@ describe('detailPanelHtml', () => {
 })
 
 describe('rowHtml', () => {
-  it('marks the initiator as page when an element triggered the request', () => {
-    expect(ov.rowHtml(req({ element: { selector: '#b', label: 'B' } }))).toContain('>page<')
-    expect(ov.rowHtml(req({ element: null }))).toContain('>bg<')
+  it('names the triggering element as the initiator, or background when there is none', () => {
+    const attributed = ov.rowHtml(req({ element: { selector: '#b', label: 'B' } }))
+    expect(attributed).toContain('◍ B')
+    expect(attributed).toContain('<span class="ov-init-dot"></span>')
+
+    const background = ov.rowHtml(req({ element: null }))
+    expect(background).toContain('◌ background')
+    expect(background).toContain('ov-init-dot ov-init-bg')
   })
 
   it('renders pending status as an ellipsis', () => {

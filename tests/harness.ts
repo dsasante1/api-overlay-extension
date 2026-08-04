@@ -141,14 +141,21 @@ function removeTrackedListeners(): void {
 
 let cachedSource: string | null = null
 
+// The manifest loads sitemap.js before content.js into one shared content-script
+// scope, and content.js calls into it — so the harness has to concatenate them in
+// the same order rather than evaluating content.js alone.
+const SOURCE_FILES = ['../dist/sitemap.js', '../dist/content.js']
+
 function overlaySource(): string {
   if (cachedSource === null) {
-    const path = resolve(__dirname, '../dist/content.js')
-    try {
-      cachedSource = readFileSync(path, 'utf8')
-    } catch {
-      throw new Error(`dist/content.js is missing — run \`npm run build\` before the tests (path: ${path})`)
-    }
+    cachedSource = SOURCE_FILES.map(rel => {
+      const path = resolve(__dirname, rel)
+      try {
+        return readFileSync(path, 'utf8')
+      } catch {
+        throw new Error(`${rel} is missing — run \`npm run build\` before the tests (path: ${path})`)
+      }
+    }).join('\n;\n')
   }
   return cachedSource
 }

@@ -6,6 +6,9 @@ type RequestStatus = number | 'pending' | 'error' | 'closed';
 type HeaderPair = [string, string];
 type DetailTab = 'response' | 'request' | 'headers' | 'timing' | 'frames';
 type DockState = 'panel' | 'pill' | 'hidden';
+// Which collection the log area is showing. 'map' is the site-map surface; its
+// discovery engine does not ship in this build, so it renders its empty state only.
+type OverlayView = 'log' | 'pinned' | 'map';
 
 // Keep the non-cache fields in sync with PreservedRequest in src/background.ts —
 // every wire field below crosses the messaging boundary for the preserve-log feature.
@@ -17,6 +20,14 @@ interface ApiRequest {
   status: RequestStatus;
   element?: ElementInfo | null;
   ts: number;
+  // The page (or SPA route) that was loaded when this call fired. Stamped by the
+  // content script rather than the injected hook, so it tracks in-page route
+  // changes for free — location.href is read once per captured request.
+  pageUrl?: string;
+  // Set once the site map has counted this request; the capture path emits
+  // several times per request (pending → status → body) and only the first
+  // terminal emit should increment a call count.
+  _smFolded?: boolean;
   reqBody?: string | null;
   resBody?: string | null;
   reqHeaders?: HeaderPair[] | null;
@@ -146,7 +157,11 @@ type PanelGeom = { left: number; top: number; width: number; height: number };
 type PillGeom = { left: number; top: number };
 let savedPanelGeom: PanelGeom | null = null;
 let savedPillGeom: PillGeom | null = null;
-let showPinTray = false;
+let currentView: OverlayView = 'log';
+// The status/method/initiator chips live in a popover rather than an always-on
+// row, so a narrow panel spends its width on the log instead of the filters.
+let filtersOpen = false;
+let settingsOpen = false;
 let ghostHeld = false;
 let ghostTimer: number | null = null;
 let clusterOutsideClickHandler: ((e: MouseEvent) => void) | null = null;
@@ -273,6 +288,10 @@ function hydrateFromPreserved(onDone: () => void): void {
           refreshSearchCache(copy, copy as OverlayMessage);
           if (pinnedKeys.has(pinKey(copy))) pinnedIds.add(localId);
           requests.set(localId, copy);
+          // Restored rows carry their original pageUrl, so they rebuild the map
+          // for pages visited earlier in this tab's history.
+          copy._smFolded = false;
+          smFoldRequest(copy);
         }
         requestsRev++;   // restored rows add new triggering-element mappings
         trimRequests();
@@ -395,7 +414,9 @@ function updateExistingRequest(existing: ApiRequest, msg: OverlayMessage): void 
 }
 
 function insertNewRequest(msg: OverlayMessage): void {
-  const fresh = { ...msg } as ApiRequest;
+  // Stamped here rather than in the injected hook, so an SPA route change is
+  // reflected without the hook needing to watch history.
+  const fresh = { ...msg, pageUrl: location.href } as ApiRequest;
   refreshSearchCache(fresh, msg);
   requests.set(fresh.id, fresh);
   requestsRev++;   // new triggering-element → id mapping
@@ -416,6 +437,11 @@ function handleOverlayMessage(msg: OverlayMessage): void {
     if (paused) return;   // pause gates new entries only
     insertNewRequest(msg);
   }
+
+  // Fold into the site map as calls land, not on demand: the aggregate has to
+  // outlive trimRequests(), which drops the oldest entries out of `requests`.
+  const folded = requests.get(msg.id);
+  if (folded) smFoldRequest(folded);
 
   scheduleRenderUnlessPaused();
 
@@ -475,6 +501,7 @@ chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, 
       clearJvHover();
       clearRevHighlight();
       clearPreserved();
+      smReset();
       renderList();
       sendResponse({ ok: true });
       break;
@@ -523,7 +550,11 @@ function setPaused(next: boolean): void {
   chrome.storage.local.set({ ovPaused: paused });
   signalInjected(paused ? 'pause' : 'resume');
   const btn = $('ov-pause');
-  if (btn) btn.textContent = paused ? 'Resume' : 'Pause';
+  if (btn) btn.textContent = paused ? '▶' : '⏸';
+  // Drives the live badge's paused colouring and the footer's capture note.
+  $('ov-panel')?.classList.toggle('ov-paused', paused);
+  refreshPill();
+  renderFooter();
   if (wasPaused && !paused) renderList();
 }
 
@@ -812,7 +843,9 @@ function httpStatusBucket(s: number): string {
   return 'err';   // 1xx and anything below
 }
 
-function statusBucket(req: ApiRequest): string {
+// Structural rather than ApiRequest: the site map folds its own lighter record
+// shape through here, and status + kind is all the bucketing actually reads.
+function statusBucket(req: { status: RequestStatus; kind?: string }): string {
   const s = req.status;
   if (s === 'pending') return 'pending';
   if (s === 'error') return 'err';
@@ -1177,6 +1210,20 @@ function focusValueHighlight(): void {
   const margin = 60;
   const visible = rect.top >= margin && rect.bottom <= window.innerHeight - margin;
   if (!visible) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  positionValueCycler();
+}
+
+// Park the cycler above the current match, flipping below it when the match sits
+// too close to the top of the viewport.
+function positionValueCycler(): void {
+  const cycler = document.getElementById('ov-value-cycler');
+  const el = valueHighlightEls[valueHighlightIndex];
+  if (!cycler || !el) return;
+  const rect = el.getBoundingClientRect();
+  const below = rect.top < 48;
+  cycler.classList.toggle('ov-vc-below', below);
+  cycler.style.top = `${window.scrollY + (below ? rect.bottom + 10 : rect.top - 10)}px`;
+  cycler.style.left = `${Math.max(window.scrollX + 4, window.scrollX + rect.left)}px`;
 }
 
 function clearValueHighlights(): void {
@@ -1188,7 +1235,7 @@ function clearValueHighlights(): void {
   valueHighlightIndex = 0;
   valueHighlightKey = '';
   for (const el of document.querySelectorAll('.ov-jv-active')) el.classList.remove('ov-jv-active');
-  document.getElementById('ov-value-status')?.remove();
+  document.getElementById('ov-value-cycler')?.remove();
 }
 
 function clearBulkHighlights(): void {
@@ -1208,9 +1255,14 @@ function clearJvHover(): void {
 // separate from the click selection (ov-value-match / valueHighlightEls) so
 // hovering never disturbs a pinned selection. Debounced because findValuesInDom
 // walks the DOM and the pointer can sweep across many .ov-jv spans.
+// The request a JSON value belongs to. Keyed off the tree host rather than a
+// row, because the tree is rendered in the docked inspector, not inside .ov-row.
+function jvRequestId(jv: HTMLElement): string {
+  return jv.closest<HTMLElement>('.ov-body-json')?.dataset.id ?? '';
+}
+
 function runJvHover(jv: HTMLElement): void {
-  const row = jv.closest<HTMLElement>('.ov-row');
-  const rowId = row?.dataset.id ?? '';
+  const rowId = jvRequestId(jv);
   const encVal = jv.dataset.ovVal ?? '';
   const kind = jv.dataset.ovKind ?? 'string';
   const key = `${rowId}|${kind}|${encVal}`;
@@ -1241,29 +1293,51 @@ function runBulkHighlight(rowId: number): void {
   for (const el of matches) el.classList.add('ov-value-match');
 }
 
+// The value-trace cycler: floats over the page beside the current match, naming
+// the traced value and offering ‹ › to step through the rest. A zero-match state
+// still shows, anchored to the panel, so "not on this screen" is an answer too.
 function setValueStatusBadge(jv: HTMLElement, total: number, index: number): void {
-  let el = document.getElementById('ov-value-status');
+  let el = document.getElementById('ov-value-cycler');
   if (!el) {
-    el = document.createElement('span');
-    el.id = 'ov-value-status';
-    el.className = 'ov-value-status';
+    el = document.createElement('div');
+    el.id = 'ov-value-cycler';
+    el.className = 'ov-value-cycler';
+    el.addEventListener('click', onValueCyclerClick);
+    document.documentElement.appendChild(el);
   }
-  if (total === 0) el.textContent = 'no match on page';
-  else if (total === 1) el.textContent = '1 match';
-  else el.textContent = `${index + 1}/${total} · click to cycle`;
+  const label = middleTruncate(safeDecodeURIComponent(jv.dataset.ovVal ?? ''), 28);
+  const nav = total > 1
+    ? `<span class="ov-vc-nav"><button class="ov-vc-btn" data-step="-1">‹</button><span class="ov-vc-pos">${index + 1} / ${total}</span><button class="ov-vc-btn" data-step="1">›</button></span>`
+    : `<span class="ov-vc-pos">${total === 1 ? '1 match' : 'not on this screen'}</span>`;
   el.dataset.empty = total === 0 ? '1' : '';
-  // Anchor the badge to the JSON host instead of next to jv. The virtualizer
-  // recycles .ov-jv spans on scroll, which would orphan an inline badge.
-  const host = jv.closest<HTMLElement>('.ov-body-json');
-  if (host?.parentElement) host.parentElement.insertBefore(el, host.nextSibling);
-  else jv.after(el);
+  el.innerHTML = `<span class="ov-vc-val">${escHtml(label)}</span><span class="ov-vc-lbl">match</span>${nav}`;
+  if (total === 0) {
+    // No anchor to sit beside — park it against the panel's top-left corner.
+    const panel = $('ov-panel')?.getBoundingClientRect();
+    el.classList.remove('ov-vc-below');
+    el.style.top = `${window.scrollY + (panel ? panel.top - 34 : 12)}px`;
+    el.style.left = `${window.scrollX + (panel ? panel.left : 12)}px`;
+    return;
+  }
+  positionValueCycler();
+}
+
+function onValueCyclerClick(e: Event): void {
+  const btn = (e.target as Element).closest<HTMLElement>('.ov-vc-btn');
+  const step = Number(btn?.dataset.step);
+  const total = valueHighlightEls.length;
+  if (!Number.isFinite(step) || total < 2) return;
+  e.stopPropagation();
+  valueHighlightIndex = (valueHighlightIndex + step + total) % total;
+  focusValueHighlight();
+  const pos = document.querySelector('#ov-value-cycler .ov-vc-pos');
+  if (pos) pos.textContent = `${valueHighlightIndex + 1} / ${total}`;
 }
 
 function handleJsonValueClick(jv: HTMLElement): void {
   clearJvHover();
   clearBulkHighlights();
-  const row = jv.closest<HTMLElement>('.ov-row');
-  const rowId = row?.dataset.id ?? '';
+  const rowId = jvRequestId(jv);
   const encVal = jv.dataset.ovVal ?? '';
   const kind = jv.dataset.ovKind ?? 'string';
   const key = `${rowId}|${kind}|${encVal}`;
@@ -1309,7 +1383,7 @@ function reattachValueHighlight(): void {
 
   // Non-virtualized path (kept as a fallback, e.g. plain-text or empty bodies).
   const span = document.querySelector<HTMLElement>(
-    `#ov-list .ov-row[data-id="${rowIdStr}"] .ov-jv[data-ov-kind="${kind}"][data-ov-val="${encVal}"]`
+    `#ov-dock .ov-body-json[data-id="${rowIdStr}"] .ov-jv[data-ov-kind="${kind}"][data-ov-val="${encVal}"]`
   );
   if (!span) { clearValueHighlights(); return; }
   span.classList.add('ov-jv-active');
@@ -1354,7 +1428,50 @@ function detailPanelHtml(req: ApiRequest): string {
     <button class="ov-copy-btn" data-url="${encodeURIComponent(req.url || '')}">copy curl</button>
   </div>`;
 
-  return `<div class="ov-detail">${tabsHtml}${detailPaneHtml(req, activeTab)}</div>`;
+  return `<div class="ov-detail" data-id="${req.id}">${detailHeadHtml(req)}${tabsHtml}${detailPaneHtml(req, activeTab)}</div>`;
+}
+
+// Identity block above the tabs: method, outcome, origin + path, and — when the
+// request was attributed to an element — the trigger banner that reveals it.
+function detailHeadHtml(req: ApiRequest): string {
+  const method = req.method || 'GET';
+  const bucket = statusBucket(req);
+  const statusLabel = req.status === 'pending'
+    ? '<span class="ov-dh-status s-pending"><span class="ov-spinner"></span>pending</span>'
+    : `<span class="ov-dh-status s-${bucket}">${escHtml(String(req.status))}</span>`;
+
+  const meta = [req.ms != null ? formatDuration(req.ms) : null, req.kind]
+    .filter(Boolean).join(' · ');
+
+  let origin = '';
+  let path = req.url;
+  try {
+    const u = new URL(req.url);
+    origin = u.origin;
+    path = u.pathname + u.search;
+  } catch { /* relative or malformed — show the whole thing as the path */ }
+
+  const isPinned = pinnedIds.has(req.id);
+  const trigger = req.element
+    ? `<button class="ov-dh-trigger" data-sel="${encodeURIComponent(req.element.selector)}">
+        <span class="ov-dh-trigger-lbl">◍ triggered by</span>
+        <span class="ov-dh-trigger-el">${escHtml(middleTruncate(req.element.label || req.element.selector, 44))}</span>
+        <span class="ov-dh-trigger-hint">→ reveal on page</span>
+      </button>`
+    : '<div class="ov-dh-trigger ov-dh-trigger-bg"><span class="ov-dh-trigger-lbl">◌ background</span><span class="ov-dh-trigger-hint">no element attributed</span></div>';
+
+  return `<div class="ov-dh">
+    <div class="ov-dh-top">
+      <span class="ov-dh-method m-${safeMethodClass(method)}">${escHtml(method)}</span>
+      ${statusLabel}
+      <span class="ov-dh-meta">${escHtml(meta)}</span>
+      <span class="ov-dh-spacer"></span>
+      <button class="ov-pin-btn ov-dh-pin${isPinned ? ' on' : ''}" data-id="${req.id}" title="Pin">${isPinned ? '★ pinned' : '☆ pin'}</button>
+      <button class="ov-dh-close" data-id="${req.id}" title="Close inspector">✕</button>
+    </div>
+    <div class="ov-dh-url"><span class="ov-dh-origin">${escHtml(origin)}</span><span class="ov-dh-path">${escHtml(path)}</span></div>
+    ${trigger}
+  </div>`;
 }
 
 function detailPaneHtml(req: ApiRequest, activeTab: DetailTab): string {
@@ -1381,8 +1498,14 @@ function responseBodyHtml(req: ApiRequest): string {
   const truncNote = parsed.truncated
     ? '<div class="ov-trunc-note">⚠ response truncated — showing recovered partial body</div>'
     : '';
-  // The tree itself is mounted by the virtualizer once the row is in the DOM.
-  return `${truncNote}<div class="ov-body-json" data-id="${req.id}"></div>`;
+  const bytes = req.resBody.length;
+  const size = bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
+  const bar = `<div class="ov-body-bar">
+      <span class="ov-body-meta">json · ${size}</span>
+      <button class="ov-reveal-all${bulkHighlightRowId === req.id ? ' on' : ''}" data-id="${req.id}">⊹ reveal all values on page</button>
+    </div>`;
+  // The tree itself is mounted by the virtualizer once the pane is in the DOM.
+  return `${truncNote}${bar}<div class="ov-body-json" data-id="${req.id}"></div>`;
 }
 
 function requestBodyHtml(req: ApiRequest): string {
@@ -1400,16 +1523,24 @@ function headersPaneHtml(req: ApiRequest): string {
     </div>`;
 }
 
+// Only the total is measured. The breakdown is drawn muted and captioned so it
+// can never be mistaken for real DNS / TCP / download numbers.
 function timingPaneHtml(req: ApiRequest): string {
   const total = req.ms ?? 0;
   const ttfb = Math.max(0, total - TIMING_DNS_MS - TIMING_TCP_MS - TIMING_DL_MS);
-  return `<div class="ov-panel"><div class="ov-kv">
+  const pending = req.status === 'pending';
+  return `<div class="ov-panel">
+    <div class="ov-kv">
+      <div class="ov-kv-k">Total</div><div class="ov-kv-v">${pending ? 'measuring…' : total + 'ms'}</div>
+    </div>
+    <div class="ov-kv ov-kv-est">
       <div class="ov-kv-k">DNS</div><div class="ov-kv-v">${TIMING_DNS_MS}ms</div>
       <div class="ov-kv-k">TCP</div><div class="ov-kv-v">${TIMING_TCP_MS}ms</div>
       <div class="ov-kv-k">TTFB</div><div class="ov-kv-v">${ttfb}ms</div>
       <div class="ov-kv-k">Download</div><div class="ov-kv-v">${TIMING_DL_MS}ms</div>
-      <div class="ov-kv-k">Total</div><div class="ov-kv-v">${total}ms</div>
-    </div></div>`;
+    </div>
+    <div class="ov-timing-note"><span>⚠</span><span>Only <b>total duration</b> is measured. DNS / TCP / download are placeholder constants, shown muted so they never read as real timings.</span></div>
+  </div>`;
 }
 
 function framesPaneHtml(req: ApiRequest): string {
@@ -1417,7 +1548,7 @@ function framesPaneHtml(req: ApiRequest): string {
   const body = msgs.length === 0
     ? '<div class="ov-body-none">No messages yet</div>'
     : msgs.slice(-100).map(m => `<div class="ov-ws-msg ov-ws-${m.dir}">
-            <span class="ov-ws-dir">${m.dir === 'sent' ? 'send ▶' : '◀ recv'}</span>
+            <span class="ov-ws-dir" title="${m.dir === 'sent' ? 'sent' : 'received'}">${m.dir === 'sent' ? '↑' : '↓'}</span>
             <span class="ov-ws-t">+${m.ts}ms</span>
             <pre class="ov-ws-body">${escHtml(m.body.slice(0, 500))}</pre>
           </div>`).join('');
@@ -1431,11 +1562,19 @@ function formatDuration(ms: number | undefined): string {
   return `${(ms / 1000).toFixed(2)}s`;
 }
 
+// Short, human-readable label for the initiator column: the element that fired
+// the request, or 'background' for anything outside the attribution window.
+function initiatorLabel(req: ApiRequest): string {
+  if (!req.element) return 'background';
+  const raw = req.element.label || req.element.selector || 'element';
+  return middleTruncate(raw, 28);
+}
+
 function rowHtml(req: ApiRequest): string {
   const bucket = statusBucket(req);
   const statusLabel = req.status === 'pending' ? '•••' : String(req.status);
   const method = req.method || 'GET';
-  const initiator = req.element ? 'page' : 'bg';
+  const isPage = !!req.element;
   const isExpanded = expandedIds.has(req.id);
   const isPinned = pinnedIds.has(req.id);
   const shortUrl = middleTruncate(urlPath(req.url), 72);
@@ -1449,36 +1588,72 @@ function rowHtml(req: ApiRequest): string {
       data-id="${req.id}" data-sel="${encodeURIComponent(req.element?.selector ?? '')}"
       title="${escHtml(req.url)}${req.element?.label ? ' — ' + escHtml(req.element.label) : ''}">
     <div class="ov-c ov-c-method m-${safeMethodClass(method)}">${escHtml(method)}</div>
-    <div class="ov-c ov-c-status s-${bucket}">${statusLabel}</div>
-    <div class="ov-c ov-c-dur">${durLabel}</div>
     <div class="ov-c ov-c-url">
+      <span class="ov-init-dot${isPage ? '' : ' ov-init-bg'}"></span>
       <span class="ov-url-path">${escHtml(shortUrl)}</span>
       ${wsFr}
-      <span class="ov-init${initiator === 'bg' ? ' ov-init-bg' : ''}">${initiator}</span>
     </div>
+    <div class="ov-c ov-c-init${isPage ? '' : ' ov-init-bg'}">${isPage ? '◍' : '◌'} ${escHtml(initiatorLabel(req))}</div>
+    <div class="ov-c ov-c-status s-${bucket}">${statusLabel}</div>
+    <div class="ov-c ov-c-dur">${durLabel}</div>
     <div class="ov-c ov-c-act">
       <button class="ov-pin-btn${isPinned ? ' on' : ''}" data-id="${req.id}" title="Pin">${isPinned ? '★' : '☆'}</button>
       <button class="ov-copy-btn" data-url="${encodeURIComponent(req.url || '')}" title="Copy URL">copy</button>
     </div>
-    ${isExpanded ? detailPanelHtml(req) : ''}
   </div>`;
 }
 
-// ── Pin tray ──────────────────────────────────────────────────────────────────
+// ── Views ─────────────────────────────────────────────────────────────────────
 
-function renderPinTray(): string {
-  if (!showPinTray) return '';
-  const pinned = [...requests.values()].filter(r => pinnedIds.has(r.id));
-  if (pinned.length === 0) {
-    return `<div class="ov-pintray">
-      <div class="ov-pintray-head">★ pinned (0)</div>
-      <div class="ov-pintray-empty">click ☆ on any row to pin it</div>
-    </div>`;
-  }
-  return `<div class="ov-pintray">
-    <div class="ov-pintray-head">★ pinned (${pinned.length})</div>
-    ${pinned.map(r => rowHtml(r)).join('')}
+// Column headings above the log, matching the row grid.
+const LIST_HEAD_HTML = `<div class="ov-list-head">
+    <span class="ov-lh ov-lh-method">mthd</span>
+    <span class="ov-lh ov-lh-path">path</span>
+    <span class="ov-lh ov-lh-init">initiator</span>
+    <span class="ov-lh ov-lh-status">stat</span>
+    <span class="ov-lh ov-lh-dur">time</span>
+    <span class="ov-lh ov-lh-act"></span>
   </div>`;
+
+// One of the design's dormant/empty cards: icon, title, body, optional footnote.
+function stateCardHtml(tone: string, icon: string, title: string, body: string, note = ''): string {
+  return `<div class="ov-state ov-state-${tone}">
+    <div class="ov-state-ico">${icon}</div>
+    <div class="ov-state-title">${title}</div>
+    <div class="ov-state-body">${body}</div>
+    ${note ? `<div class="ov-state-note">${note}</div>` : ''}
+  </div>`;
+}
+
+function pinnedViewHtml(): string {
+  const pinned = [...requests.values()].filter(r => pinnedIds.has(r.id)).reverse();
+  if (pinned.length === 0) {
+    return stateCardHtml('idle', '★', 'Nothing pinned',
+      'Pin a request with ☆ to keep it reachable while the log scrolls. Pins are stored by method and path, so they survive reloads.');
+  }
+  return LIST_HEAD_HTML + pinned.map(r => rowHtml(r)).join('');
+}
+
+// Is the site-map surface the one on screen? sitemap.ts asks before it re-renders,
+// so the engine never has to know how the overlay switches views.
+function siteMapVisible(): boolean {
+  return currentView === 'map';
+}
+
+// The site-map surface. Discovery, static analysis and page verification live in
+// sitemap.ts; this renders whatever the engine has built so far, or the primer
+// with a Build control when nothing has been discovered yet.
+function siteMapViewHtml(): string {
+  if (smBuiltAt || smIsBuilding()) return smSiteMapHtml();
+  return `${stateCardHtml('idle', '⌗', 'No site map built yet',
+    'Map every page of this site against the API endpoints it uses. Pages are found from links, sitemap.xml and robots.txt; endpoints from captured traffic, any published OpenAPI document, and static analysis of page HTML and JS.',
+    'Nothing is navigated without asking — logout, delete and reset routes are never loaded')}
+    <div class="ov-tier-legend">
+      <span class="ov-tier ov-tier-observed"><span class="ov-tier-swatch"></span>observed · facts</span>
+      <span class="ov-tier ov-tier-declared"><span class="ov-tier-swatch"></span>declared · openapi</span>
+      <span class="ov-tier ov-tier-inferred"><span class="ov-tier-swatch"></span>inferred · candidates</span>
+    </div>
+    <div class="ov-state-actions"><button class="ov-btn-primary" id="ov-build-map">Build map</button></div>`;
 }
 
 // ── Footer ────────────────────────────────────────────────────────────────────
@@ -1498,12 +1673,8 @@ function renderFooter(): void {
     <button class="ov-fstat ov-fstat-btn${slow ? ' ov-fstat-warn' : ''}${activeFlags.has('slow') ? ' on' : ''}" data-f="slow" ${slow ? '' : 'disabled'} data-tip="Filter: slow (&gt;800ms)">slow <b>${slow}</b></button>
     <span class="ov-fstat">xfer <b>${(xfer / 1024).toFixed(1)}kb</b></span>
     <span class="ov-fspacer"></span>
-    <button class="ov-pin-toggle${showPinTray ? ' on' : ''}" id="ov-pin-tray-btn" data-tip="Show / hide pinned requests" data-tip-pos="above" data-tip-align="right">★ ${pinnedIds.size}</button>
+    <span class="ov-fnote">${paused ? 'paused' : 'capturing'} · ${location.host}</span>
   `;
-  $('ov-pin-tray-btn')!.onclick = () => {
-    showPinTray = !showPinTray;
-    renderList();
-  };
 }
 
 // ── Main render ───────────────────────────────────────────────────────────────
@@ -1577,30 +1748,81 @@ function selectVisibleRequests(snapshot: ApiRequest[], matcher: TextMatcher): Ap
   return visible;
 }
 
+// Two distinct empty states: nothing captured yet (listening) versus captured
+// something the current filters exclude.
 function listEmptyStateHtml(): string {
-  const body = requests.size === 0
-    ? 'No API calls captured yet.<br><small>Interact with the page to see calls appear here.</small>'
-    : 'No results match your filter.';
-  return `<div class="ov-empty">${body}</div>`;
+  if (requests.size === 0) {
+    return `<div class="ov-empty">${stateCardHtml('live', '<span class="ov-live-dot"></span>', 'Listening…',
+      'No API calls captured yet. Interact with the page to record its first request.',
+      '0 requests')}</div>`;
+  }
+  return `<div class="ov-empty">${stateCardHtml('idle', '⌕', 'No matches',
+    'Nothing in the log matches the current search and filters.',
+    `${requests.size} captured`)}</div>`;
 }
 
 function renderCspBlocked(list: HTMLElement, countEl: HTMLElement | null): void {
-  list.innerHTML = `<div class="ov-empty" style="color:var(--ov-s-err)">
-      Capture script failed to load.<br><small>Likely blocked by the page's Content-Security-Policy.</small>
-    </div>`;
+  list.innerHTML = `<div class="ov-empty">${stateCardHtml('warn', '⚠', 'Capture blocked',
+    "This page's Content-Security-Policy stopped the capture hook from loading, so the live log cannot record anything here.",
+    'content-security-policy')}</div>`;
   if (countEl) countEl.textContent = '0';
+  closeDock();
   renderFooter();
 }
 
 // Mount a virtualizer for every visible JSON response placeholder.
-function mountVisibleJsonTrees(list: HTMLElement): void {
-  for (const host of list.querySelectorAll<HTMLElement>('.ov-body-json[data-id]')) {
+function mountVisibleJsonTrees(root: HTMLElement): void {
+  for (const host of root.querySelectorAll<HTMLElement>('.ov-body-json[data-id]')) {
     const id = Number(host.dataset.id);
     const req = requests.get(id);
     if (!req?.resBody) continue;
     const parsed = tryParseJsonContainer(req.resBody);
     if (parsed === undefined) continue;
     jvVirtMounts.set(host, mountJsonVirtualizer(host, flattenJsonRows(parsed), id));
+  }
+}
+
+// The docked inspector. At most one request is open at a time, so the dock shows
+// the current selection and hides itself when there is none.
+function selectedRequestId(): number | null {
+  for (const id of expandedIds) if (requests.has(id)) return id;
+  return null;
+}
+
+function closeDock(): void {
+  const dock = $('ov-dock');
+  if (!dock) return;
+  dock.innerHTML = '';
+  dock.toggleAttribute('hidden', true);
+}
+
+function renderDock(): void {
+  const dock = $('ov-dock');
+  if (!dock) return;
+  const id = currentView === 'map' ? null : selectedRequestId();
+  const req = id == null ? undefined : requests.get(id);
+  if (!req) { closeDock(); return; }
+  dock.toggleAttribute('hidden', false);
+  dock.innerHTML = detailPanelHtml(req);
+  mountVisibleJsonTrees(dock);
+}
+
+function viewBodyHtml(visible: ApiRequest[]): string {
+  if (currentView === 'map') return siteMapViewHtml();
+  if (currentView === 'pinned') return pinnedViewHtml();
+  return visible.length === 0
+    ? listEmptyStateHtml()
+    : LIST_HEAD_HTML + visible.map(r => rowHtml(r)).join('');
+}
+
+function syncViewTabs(): void {
+  for (const tab of document.querySelectorAll<HTMLElement>('#ov-views .ov-view')) {
+    tab.classList.toggle('on', tab.dataset.v === currentView);
+  }
+  const pinN = $('ov-view-pin-n');
+  if (pinN) {
+    pinN.textContent = String(pinnedIds.size);
+    pinN.toggleAttribute('hidden', pinnedIds.size === 0);
   }
 }
 
@@ -1611,6 +1833,7 @@ function renderList(): void {
   const list = $('ov-list');
   const countEl = $('ov-count');
   if (!list) return;
+  syncViewTabs();
   if (cspBlocked) { renderCspBlocked(list, countEl); return; }
 
   const matcher = buildTextMatcher(filterInput?.value ?? '');
@@ -1619,23 +1842,37 @@ function renderList(): void {
   const snapshot = Array.from(requests.values());
   const visible = selectVisibleRequests(snapshot, matcher);
 
-  if (countEl) countEl.textContent = `${visible.length}/${requests.size}`;
+  if (countEl) {
+    // Over a built map the request tally means nothing; report the discovery
+    // instead. Before a build there is nothing to report, so the tally stands.
+    const t = smTally();
+    countEl.textContent = currentView === 'map' && (smBuiltAt || smIsBuilding())
+      ? `${t.pages}p/${t.endpoints}e`
+      : `${visible.length}/${requests.size}`;
+  }
   updateChipCounts(snapshot);
-
-  let html = showPinTray ? renderPinTray() : '';
-  html += visible.length === 0 ? listEmptyStateHtml() : visible.map(r => rowHtml(r)).join('');
+  updateSearchHits(visible.length);
+  refreshFiltersBadge();
 
   // Snapshot scroll positions of currently mounted JSON virtualizers, then tear
-  // them down — innerHTML below will detach their DOM hosts.
+  // them down — the innerHTML writes below will detach their DOM hosts.
   captureJvScrollState();
   destroyAllJvVirt();
 
-  list.innerHTML = html;
-  mountVisibleJsonTrees(list);
+  list.innerHTML = viewBodyHtml(visible);
+  renderDock();
 
   reattachValueHighlight();
   reattachRevHighlight();
   renderFooter();
+}
+
+// Live match count beside the search box; blank when nothing is being searched.
+function updateSearchHits(count: number): void {
+  const el = $('ov-hits');
+  if (!el) return;
+  const term = filterInput?.value ?? '';
+  el.textContent = term ? `${count} hit${count === 1 ? '' : 's'}` : '';
 }
 
 function updateChipCounts(snapshot: ApiRequest[]): void {
@@ -1653,11 +1890,13 @@ function updateChipCounts(snapshot: ApiRequest[]): void {
 
 // ── Event delegation ──────────────────────────────────────────────────────────
 
-let rowEventsBound = false;
+// The log and the docked inspector both host rows/values, so each gets the same
+// delegate; the WeakSet keeps a re-bind on the same container a no-op.
+const rowEventsBound = new WeakSet<HTMLElement>();
 
 function bindListDelegation(list: HTMLElement): void {
-  if (rowEventsBound) return;
-  rowEventsBound = true;
+  if (rowEventsBound.has(list)) return;
+  rowEventsBound.add(list);
 
   list.addEventListener('mouseover', (e: Event) => {
     const jv = (e.target as Element).closest<HTMLElement>('.ov-jv');
@@ -1755,14 +1994,22 @@ function switchDetailTab(tabBtn: HTMLElement): void {
   scheduleRender();
 }
 
+function collapseRow(id: number): void {
+  expandedIds.delete(id);
+  detailTabs.delete(id);
+  if (valueHighlightKey.startsWith(`${id}|`)) clearValueHighlights();
+  if (bulkHighlightRowId === id) clearBulkHighlights();
+}
+
+// The inspector is a single dock rather than a per-row accordion, so opening a
+// request closes whatever was open before it.
 function toggleRowExpansion(row: HTMLElement): void {
   const id = Number(row.dataset.id);
+  if (!Number.isFinite(id)) return;
   if (expandedIds.has(id)) {
-    expandedIds.delete(id);
-    detailTabs.delete(id);
-    if (valueHighlightKey.startsWith(`${id}|`)) clearValueHighlights();
-    if (bulkHighlightRowId === id) clearBulkHighlights();
+    collapseRow(id);
   } else {
+    for (const other of [...expandedIds]) collapseRow(other);
     expandedIds.add(id);
     if ((detailTabs.get(id) ?? 'response') === 'response') runBulkHighlight(id);
   }
@@ -1798,16 +2045,68 @@ function onListClick(e: Event): void {
   const tabBtn = target.closest<HTMLElement>('.ov-tab');
   if (tabBtn) { e.stopPropagation(); switchDetailTab(tabBtn); return; }
 
+  const closeBtn = target.closest<HTMLElement>('.ov-dh-close');
+  if (closeBtn) {
+    e.stopPropagation();
+    const id = Number(closeBtn.dataset.id);
+    if (Number.isFinite(id)) { collapseRow(id); scheduleRender(); }
+    return;
+  }
+
+  const trigger = target.closest<HTMLElement>('.ov-dh-trigger[data-sel]');
+  if (trigger) {
+    e.stopPropagation();
+    revealElement(safeDecodeURIComponent(trigger.dataset.sel ?? ''));
+    return;
+  }
+
+  const revealAll = target.closest<HTMLElement>('.ov-reveal-all');
+  if (revealAll) {
+    e.stopPropagation();
+    toggleRevealAll(revealAll);
+    return;
+  }
+
+  if (target.closest('#ov-build-map')) {
+    e.stopPropagation();
+    smEnsureBuilt();
+    return;
+  }
+
   const jv = target.closest<HTMLElement>('.ov-jv');
   if (jv) { e.stopPropagation(); handleJsonValueClick(jv); return; }
 
   const row = target.closest<HTMLElement>('.ov-row');
-  if (!row) return;
-  // The detail panel is rendered inside .ov-row, so a click on its body (not on
-  // a tab/copy/value control handled above) would otherwise bubble here and
-  // collapse the row. Only the summary header toggles expansion.
-  if (target.closest('.ov-detail')) return;
-  toggleRowExpansion(row);
+  if (row) toggleRowExpansion(row);
+}
+
+// Bring the element that fired the selected request into view and mark it.
+// Unlike the hover highlight this is an explicit request, so it always centres
+// the element rather than only scrolling when it happens to be off-screen.
+function revealElement(selector: string): void {
+  if (!selector) return;
+  highlightEl(selector);
+  activeHighlight?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+// "Reveal all values on page" — the whole-response counterpart to clicking one
+// JSON value. Reports how many matches were found on the button itself.
+function toggleRevealAll(btn: HTMLElement): void {
+  const id = Number(btn.dataset.id);
+  if (!Number.isFinite(id)) return;
+  if (bulkHighlightRowId === id) {
+    clearBulkHighlights();
+    btn.classList.remove('on');
+    btn.textContent = '⊹ reveal all values on page';
+    return;
+  }
+  clearValueHighlights();
+  runBulkHighlight(id);
+  btn.classList.add('on');
+  const n = bulkHighlightEls.length;
+  btn.textContent = n === 0
+    ? '⊹ no values from this response on the page'
+    : `⊹ ${n} value${n === 1 ? '' : 's'} revealed on page`;
 }
 
 function bindChipDelegation(container: HTMLElement): void {
@@ -1926,15 +2225,19 @@ function pillInnerHtml(): string {
   const total = reqs.length;
   const errs = reqs.filter(isError).length;
   const recent = reqs.slice(-12);
-  const ticks = recent.map(r => {
+  // Bar height carries recency: the newest calls stand tallest, so the rail
+  // reads as a trend rather than a flat row of ticks.
+  const ticks = recent.map((r, i) => {
     const cls = pillTickClass(r);
-    return `<span class="ov-pill-tick${cls ? ' ' + cls : ''}"></span>`;
+    const h = 5 + Math.round((i / Math.max(1, recent.length - 1)) * 9);
+    return `<span class="ov-pill-tick${cls ? ' ' + cls : ''}" style="height:${h}px"></span>`;
   }).join('');
   return `
-    <span class="ov-pill-dot"></span>
+    <span class="ov-mark">C</span>
+    <span class="ov-pill-dot${paused ? ' ov-pill-paused' : ''}"></span>
     <span class="ov-pill-count">${total}</span>
     <span class="ov-pill-label">req</span>
-    ${errs ? `<span class="ov-pill-err">${errs} err</span>` : ''}
+    ${errs ? `<span class="ov-pill-err">${errs}⚠</span>` : ''}
     <span class="ov-pill-rail">${ticks}</span>
     <button class="ov-pill-expand" title="Expand panel">⤢</button>
   `;
@@ -1975,49 +2278,68 @@ function buildPanel(): void {
   panel.innerHTML = `
     <div id="ov-header">
       <div class="ov-grip"></div>
-      <span class="ov-hdr-title">API Overlay</span>
-      <span id="ov-count" class="ov-count-badge" data-tip="Visible / total requests">0/0</span>
-      <div class="ov-hdr-spacer"></div>
-      <div id="ov-actions">
-        <button id="ov-pause" data-tip="Pause or resume capturing">${paused ? '▶ rec' : '⏸ pause'}</button>
-        <div class="ov-divider"></div>
-        <button id="ov-theme" data-tip="Toggle dark / light theme">${currentTheme === 'dark' ? 'light' : 'dark'}</button>
-        <button id="ov-export" data-tip="Export as HAR file">↓ har</button>
-        <div class="ov-divider"></div>
-        <button id="ov-clear" data-tip="Clear all requests">✕ clear</button>
-        <button id="ov-collapse" data-tip="Collapse to pill" data-tip-align="right">_</button>
+      <div class="ov-mark">C</div>
+      <span class="ov-hdr-title">CalloutAPI</span>
+      <span id="ov-live" class="ov-live"><span class="ov-live-dot"></span><span id="ov-count">0/0</span></span>
+      <div id="ov-views" class="ov-views">
+        <button class="ov-view" data-v="log" data-tip="Captured requests">Log</button>
+        <button class="ov-view" data-v="pinned" data-tip="Pinned requests">Pinned<span class="ov-view-n" id="ov-view-pin-n">0</span></button>
+        <button class="ov-view" data-v="map" data-tip="Site map — pages to endpoints">Map</button>
       </div>
-    </div>
-    <div id="ov-filter-row">
       <div class="ov-search">
-        <span class="ov-prompt">›</span>
-        <input id="ov-filter" placeholder="filter url, body, header…" autocomplete="off" spellcheck="false"/>
+        <span class="ov-prompt">⌕</span>
+        <input id="ov-filter" placeholder="search url · request · response" autocomplete="off" spellcheck="false"/>
+        <span id="ov-hits" class="ov-hits"></span>
         <div class="ov-search-modes">
           <button id="ov-case-toggle" class="ov-modebtn" data-tip="Case-sensitive search" data-tip-align="right">Aa</button>
           <button id="ov-regex-toggle" class="ov-modebtn" data-tip="Regex search" data-tip-align="right">.*</button>
         </div>
       </div>
+      <button id="ov-filters-btn" class="ov-filters-btn" data-tip="Status, method and initiator filters">
+        <span class="ov-filters-ico">⛃</span><span class="ov-filters-lbl">Filters</span><span id="ov-filters-n" class="ov-filters-n" hidden>0</span><span class="ov-filters-caret">▾</span>
+      </button>
+      <div id="ov-actions">
+        <button id="ov-pause" data-tip="Pause or resume capturing">${paused ? '▶' : '⏸'}</button>
+        <button id="ov-settings-btn" data-tip="Theme, export and clear">⚙</button>
+        <button id="ov-collapse" data-tip="Minimize" data-tip-align="right">▁</button>
+      </div>
+      <div id="ov-settings" class="ov-menu" hidden>
+        <button class="ov-menu-item" id="ov-theme"><span class="ov-menu-ico">◐</span>Toggle theme</button>
+        <button class="ov-menu-item" id="ov-export"><span class="ov-menu-ico">↓</span>Export HAR</button>
+        <button class="ov-menu-item ov-menu-danger" id="ov-clear"><span class="ov-menu-ico">🗑</span>Clear log</button>
+      </div>
     </div>
-    <div id="ov-chips">
-      <span class="ov-chip-label">status</span>
-      <button class="ov-chip" data-s="2xx" data-tip="Filter: 2xx success">2xx<span class="ov-chip-count">0</span></button>
-      <button class="ov-chip" data-s="3xx" data-tip="Filter: 3xx redirects">3xx<span class="ov-chip-count">0</span></button>
-      <button class="ov-chip" data-s="4xx" data-tip="Filter: 4xx client errors">4xx<span class="ov-chip-count">0</span></button>
-      <button class="ov-chip" data-s="5xx" data-tip="Filter: 5xx server errors">5xx<span class="ov-chip-count">0</span></button>
-      <span class="ov-chip-sep"></span>
-      <span class="ov-chip-label">method</span>
-      <button class="ov-chip" data-m="GET" data-tip="Filter: GET requests">GET</button>
-      <button class="ov-chip" data-m="POST" data-tip="Filter: POST requests">POST</button>
-      <button class="ov-chip" data-m="PUT" data-tip="Filter: PUT requests">PUT</button>
-      <button class="ov-chip" data-m="PATCH" data-tip="Filter: PATCH requests">PATCH</button>
-      <button class="ov-chip" data-m="DELETE" data-tip="Filter: DELETE requests">DEL</button>
-      <button class="ov-chip" data-m="WS" data-tip="Filter: WebSocket connections">WS</button>
-      <span class="ov-chip-sep"></span>
-      <span class="ov-chip-label">from</span>
-      <button class="ov-chip" data-i="page" data-tip="Requests from page scripts">page</button>
-      <button class="ov-chip" data-i="bg" data-tip="Background / extension requests">bg</button>
+    <div id="ov-chips" hidden>
+      <div class="ov-chip-group">
+        <span class="ov-chip-label">status</span>
+        <div class="ov-chip-set">
+          <button class="ov-chip ov-chip-pill" data-s="2xx" data-tip="Filter: 2xx success">2xx<span class="ov-chip-count">0</span></button>
+          <button class="ov-chip ov-chip-pill" data-s="3xx" data-tip="Filter: 3xx redirects">3xx<span class="ov-chip-count">0</span></button>
+          <button class="ov-chip ov-chip-pill" data-s="4xx" data-tip="Filter: 4xx client errors">4xx<span class="ov-chip-count">0</span></button>
+          <button class="ov-chip ov-chip-pill" data-s="5xx" data-tip="Filter: 5xx server errors">5xx<span class="ov-chip-count">0</span></button>
+        </div>
+      </div>
+      <div class="ov-chip-group">
+        <span class="ov-chip-label">method</span>
+        <div class="ov-chip-set">
+          <button class="ov-chip" data-m="GET" data-tip="Filter: GET requests">GET</button>
+          <button class="ov-chip" data-m="POST" data-tip="Filter: POST requests">POST</button>
+          <button class="ov-chip" data-m="PUT" data-tip="Filter: PUT requests">PUT</button>
+          <button class="ov-chip" data-m="PATCH" data-tip="Filter: PATCH requests">PATCH</button>
+          <button class="ov-chip" data-m="DELETE" data-tip="Filter: DELETE requests">DEL</button>
+          <button class="ov-chip" data-m="WS" data-tip="Filter: WebSocket connections">WS</button>
+        </div>
+      </div>
+      <div class="ov-chip-group">
+        <span class="ov-chip-label">initiator</span>
+        <div class="ov-chip-set">
+          <button class="ov-chip ov-chip-wide" data-i="page" data-tip="Requests a page element triggered">◍ user</button>
+          <button class="ov-chip ov-chip-wide" data-i="bg" data-tip="Background / automatic requests">◌ background</button>
+        </div>
+      </div>
     </div>
     <div id="ov-list"></div>
+    <div id="ov-dock" hidden></div>
     <div id="ov-footer"></div>
     <div class="ov-resize-handle" data-dir="n"></div>
     <div class="ov-resize-handle" data-dir="s"></div>
@@ -2049,6 +2371,7 @@ function buildPanel(): void {
     clearAllBadges(); clearValueHighlights(); clearBulkHighlights();
     clearJvHover(); clearRevHighlight();
     clearPreserved();
+    smReset();
     renderList();
   };
   if (ovPause) ovPause.onclick = () => setPaused(!paused);
@@ -2071,13 +2394,78 @@ function buildPanel(): void {
     renderList();
   };
 
+  bindViewTabs($('ov-views')!);
+  bindPopovers();
+
   makeDraggable(panel, $('ov-header')!);
   makeResizable(panel);
   const list = $('ov-list')!;
   bindListDelegation(list);
+  bindListDelegation($('ov-dock')!);
+  smBindSiteMapDelegation(list);
   bindChipDelegation($('ov-chips')!);
   bindFooterDelegation($('ov-footer')!);
   renderList();
+}
+
+// ── View tabs & filters popover ───────────────────────────────────────────────
+
+function setView(next: OverlayView): void {
+  if (next === currentView) return;
+  currentView = next;
+  chrome.storage.local.set({ ovView: next });
+  renderList();
+}
+
+function bindViewTabs(container: HTMLElement): void {
+  container.addEventListener('click', (e: Event) => {
+    const btn = (e.target as Element).closest<HTMLElement>('.ov-view');
+    const v = btn?.dataset.v;
+    if (v === 'log' || v === 'pinned' || v === 'map') setView(v);
+  });
+}
+
+function setFiltersOpen(open: boolean): void {
+  filtersOpen = open;
+  $('ov-chips')?.toggleAttribute('hidden', !open);
+  $('ov-filters-btn')?.classList.toggle('on', open);
+  if (open) setSettingsOpen(false);
+}
+
+function setSettingsOpen(open: boolean): void {
+  settingsOpen = open;
+  $('ov-settings')?.toggleAttribute('hidden', !open);
+  $('ov-settings-btn')?.classList.toggle('ov-active', open);
+  if (open) setFiltersOpen(false);
+}
+
+// Both header popovers dismiss on the next click that lands outside them.
+function bindPopovers(): void {
+  const filters = $('ov-filters-btn');
+  if (filters) filters.onclick = () => setFiltersOpen(!filtersOpen);
+  const settings = $('ov-settings-btn');
+  if (settings) settings.onclick = () => setSettingsOpen(!settingsOpen);
+
+  $('ov-panel')?.addEventListener('click', (e: Event) => {
+    const t = e.target as Element;
+    if (filtersOpen && !t.closest('#ov-chips') && !t.closest('#ov-filters-btn')) setFiltersOpen(false);
+    if (settingsOpen && !t.closest('#ov-settings-btn')) setSettingsOpen(false);
+  });
+}
+
+// Number of chip filters currently constraining the log — the badge on the
+// Filters button, so an active filter is visible while the popover is shut.
+function activeFilterCount(): number {
+  return activeStatus.size + activeMethods.size + activeInitiators.size;
+}
+
+function refreshFiltersBadge(): void {
+  const n = activeFilterCount();
+  const badge = $('ov-filters-n');
+  if (!badge) return;
+  badge.textContent = String(n);
+  badge.toggleAttribute('hidden', n === 0);
+  $('ov-filters-btn')?.classList.toggle('ov-has-filters', n > 0);
 }
 
 // ── HAR export ────────────────────────────────────────────────────────────────
@@ -2269,7 +2657,11 @@ function navigateToRequest(id: number): void {
   } else {
     $('ov-panel')?.style.setProperty('display', 'flex', 'important');
   }
+  // A marker can point at a request the Map view would never list; jump back to
+  // the log so the row it scrolls to actually exists.
+  if (currentView === 'map') currentView = 'log';
   if (!expandedIds.has(id)) {
+    for (const other of [...expandedIds]) collapseRow(other);
     expandedIds.add(id);
     if ((detailTabs.get(id) ?? 'response') === 'response') runBulkHighlight(id);
   }
@@ -2595,36 +2987,55 @@ function injectStyles(): void {
   const s = document.createElement('style');
   s.id = 'ov-styles';
   s.textContent = `
+    /* ══ Tokens ══════════════════════════════════════════════════════════════
+       The overlay renders inside pages whose CSS it does not control, so every
+       declaration is !important and the root does a full 'all: initial' reset.
+       Custom properties survive that reset, which is what makes theming work. */
     #ov-panel {
       all: initial;
       /* dark theme (default) */
-      --ov-bg:               #0d0e10;
-      --ov-bg-2:             #14161a;
-      --ov-bg-3:             #1a1d22;
-      --ov-hdr:              #14161a;
-      --ov-border:           #2a2f37;
-      --ov-grid:             #1f2329;
-      --ov-text:             #d6dae0;
-      --ov-text-dim:         #9aa1ab;
-      --ov-text-muted:       #6a7180;
-      --ov-text-faint:       #4a505c;
-      --ov-title:            #d6dae0;
-      --ov-accent:           #6ab0ff;
-      --ov-accent-bg:        rgba(106,176,255,.14);
-      --ov-m-get:            #6ab0ff;
-      --ov-m-post:           #b58cff;
-      --ov-m-put:            #ffb86c;
-      --ov-m-patch:          #ffd86c;
-      --ov-m-delete:         #ff6b8a;
-      --ov-m-ws:             #4ec9b0;
-      --ov-s-2xx:            #7a8290;
-      --ov-s-3xx:            #d4a85e;
-      --ov-s-4xx:            #ff9a52;
-      --ov-s-5xx:            #ff5a6e;
-      --ov-s-err:            #ff5a6e;
-      --ov-s-pending:        #4ec9b0;
-      --ov-scrollbar:        #2a2f37;
-      --ov-shadow:           rgba(0,0,0,.6);
+      --ov-bg:               #0e1116;
+      --ov-bg-2:             #12171e;
+      --ov-bg-3:             #161c24;
+      --ov-log:              #0b0f14;
+      --ov-hdr:              linear-gradient(#161b22,#12161c);
+      --ov-hdr-flat:         #12161c;
+      --ov-border:           #232c37;
+      --ov-border-soft:      #1b222b;
+      --ov-grid:             #12171e;
+      --ov-text:             #d7dee7;
+      --ov-text-dim:         #c3cdd8;
+      --ov-text-muted:       #8a97a6;
+      --ov-text-faint:       #6b7684;
+      --ov-text-ghost:       #4f5a67;
+      --ov-title:            #eef2f7;
+      --ov-accent:           #5b8cff;
+      --ov-accent-soft:      #8fb0ff;
+      --ov-accent-bg:        rgba(91,140,255,.14);
+      --ov-accent-bd:        rgba(91,140,255,.35);
+      --ov-trace:            #b78bff;
+      --ov-trace-bg:         rgba(139,91,255,.18);
+      --ov-trace-bd:         rgba(139,91,255,.45);
+      --ov-mark:             linear-gradient(135deg,#5b8cff,#8a5bff);
+      --ov-mark-fg:          #0a0c0f;
+      --ov-m-get:            #7bb0a0;
+      --ov-m-post:           #4c9dff;
+      --ov-m-put:            #d9a441;
+      --ov-m-patch:          #d9a441;
+      --ov-m-delete:         #e5615e;
+      --ov-m-ws:             #b78bff;
+      --ov-s-2xx:            #4ec9a5;
+      --ov-s-3xx:            #54b8c8;
+      --ov-s-4xx:            #d9a441;
+      --ov-s-5xx:            #e5615e;
+      --ov-s-err:            #e5615e;
+      --ov-s-pending:        #5b8cff;
+      --ov-scrollbar:        #2a333f;
+      --ov-shadow:           0 40px 90px -20px rgba(0,0,0,.7);
+      --ov-shadow-pop:       0 24px 50px -12px rgba(0,0,0,.75);
+      --ov-r-sm:             5px;
+      --ov-r:                7px;
+      --ov-r-lg:             10px;
       position: fixed !important;
       bottom: 20px !important;
       right: 20px !important;
@@ -2636,263 +3047,439 @@ function injectStyles(): void {
       max-height: 95vh !important;
       background: var(--ov-bg) !important;
       color: var(--ov-text) !important;
-      border-radius: 2px !important;
-      box-shadow: 0 12px 40px var(--ov-shadow) !important;
+      border-radius: 12px !important;
+      box-shadow: var(--ov-shadow), 0 0 0 1px rgba(255,255,255,.02) inset !important;
       z-index: 2147483647 !important;
-      font-family: var(--ov-font-family,'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace) !important;
+      font-family: var(--ov-font-family,'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace) !important;
       font-size: calc(12px * var(--ov-font-scale,1)) !important;
       display: flex !important;
       flex-direction: column !important;
       overflow: hidden !important;
       border: 1px solid var(--ov-border) !important;
+      /* Drives the narrow-panel rules below; the workspace can be resized to
+         roughly 360px, at which point secondary columns give up their space. */
+      container-type: inline-size !important;
     }
     #ov-panel[data-theme="light"] {
-      --ov-bg:               #fbfaf7;
-      --ov-bg-2:             #ffffff;
-      --ov-bg-3:             #f3f1ec;
-      --ov-hdr:              #ffffff;
-      --ov-border:           #d9d4c4;
-      --ov-grid:             #ebe6d8;
-      --ov-text:             #1a1c20;
-      --ov-text-dim:         #4a4f59;
-      --ov-text-muted:       #6c727c;
-      --ov-text-faint:       #9a9fa8;
-      --ov-title:            #1a1c20;
-      --ov-accent:           #2a6fdb;
-      --ov-accent-bg:        rgba(42,111,219,.12);
-      --ov-m-get:            #1f6feb;
-      --ov-m-post:           #7a3df0;
-      --ov-m-put:            #b8631a;
-      --ov-m-patch:          #a6791f;
-      --ov-m-delete:         #d23158;
-      --ov-m-ws:             #1a8473;
-      --ov-s-2xx:            #6c727c;
-      --ov-s-3xx:            #8a5a14;
-      --ov-s-4xx:            #b8541d;
-      --ov-s-5xx:            #c0273f;
-      --ov-s-err:            #c0273f;
-      --ov-s-pending:        #1a8473;
-      --ov-scrollbar:        #d9d4c4;
-      --ov-shadow:           rgba(0,0,0,.15);
+      --ov-bg:               #ffffff;
+      --ov-bg-2:             #f7f9fb;
+      --ov-bg-3:             #eef1f5;
+      --ov-log:              #fafbfc;
+      --ov-hdr:              #f3f5f8;
+      --ov-hdr-flat:         #f3f5f8;
+      --ov-border:           #dce1e8;
+      --ov-border-soft:      #e4e8ee;
+      --ov-grid:             #f0f2f5;
+      --ov-text:             #1c2530;
+      --ov-text-dim:         #3a4552;
+      --ov-text-muted:       #5c6773;
+      --ov-text-faint:       #67727e;
+      --ov-text-ghost:       #98a2ae;
+      --ov-title:            #1c2530;
+      --ov-accent:           #2563eb;
+      --ov-accent-soft:      #1d4ed8;
+      --ov-accent-bg:        rgba(37,99,235,.10);
+      --ov-accent-bd:        rgba(37,99,235,.35);
+      --ov-trace:            #7c3aed;
+      --ov-trace-bg:         rgba(124,58,237,.14);
+      --ov-trace-bd:         rgba(124,58,237,.45);
+      --ov-mark:             linear-gradient(135deg,#3b6fe0,#7c3aed);
+      --ov-mark-fg:          #ffffff;
+      --ov-m-get:            #2f8f6f;
+      --ov-m-post:           #2563eb;
+      --ov-m-put:            #b7791f;
+      --ov-m-patch:          #b7791f;
+      --ov-m-delete:         #d64545;
+      --ov-m-ws:             #7c3aed;
+      --ov-s-2xx:            #17915f;
+      --ov-s-3xx:            #0f7490;
+      --ov-s-4xx:            #b7791f;
+      --ov-s-5xx:            #d64545;
+      --ov-s-err:            #d64545;
+      --ov-s-pending:        #2563eb;
+      --ov-scrollbar:        #cfd5de;
+      --ov-shadow:           0 30px 60px -24px rgba(20,30,50,.35);
+      --ov-shadow-pop:       0 18px 40px -12px rgba(20,30,50,.28);
     }
 
-    /* ── Header ── */
+    @keyframes ov-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+    @keyframes ov-spin  { to { transform: rotate(360deg); } }
+    @keyframes ov-fadein { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+
+    /* ══ Header — one compact toolbar ═══════════════════════════════════════ */
     #ov-header {
       display: flex !important;
       align-items: center !important;
-      gap: 6px !important;
-      padding: 0 8px 0 10px !important;
-      height: 36px !important;
+      gap: 8px !important;
+      padding: 8px 10px !important;
       background: var(--ov-hdr) !important;
       cursor: move !important;
       user-select: none !important;
       border-bottom: 1px solid var(--ov-border) !important;
       flex-shrink: 0 !important;
+      flex-wrap: nowrap !important;
     }
     .ov-grip {
-      display: grid !important;
-      grid-template-columns: 3px 3px !important;
-      grid-template-rows: repeat(3, 3px) !important;
-      gap: 2px !important;
-      flex-shrink: 0 !important;
-      margin-right: 2px !important;
-    }
-    .ov-grip::before, .ov-grip::after {
-      content: '' !important;
-      display: none !important;
-    }
-    .ov-grip {
-      background-image: radial-gradient(circle, var(--ov-text-faint) 1px, transparent 1px) !important;
+      background-image: radial-gradient(circle, var(--ov-text-ghost) 1px, transparent 1px) !important;
       background-size: 4px 4px !important;
       width: 8px !important;
       height: 12px !important;
-      background-position: 0 0 !important;
-      border-radius: 0 !important;
+      flex-shrink: 0 !important;
+    }
+    .ov-mark {
+      width: 20px !important;
+      height: 20px !important;
+      border-radius: var(--ov-r-sm) !important;
+      background: var(--ov-mark) !important;
+      color: var(--ov-mark-fg) !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      font-weight: 700 !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      flex-shrink: 0 !important;
+      font-family: inherit !important;
     }
     .ov-hdr-title {
-      font-weight: 700 !important;
-      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      font-weight: 600 !important;
+      font-size: calc(12px * var(--ov-font-scale,1)) !important;
       color: var(--ov-title) !important;
-      letter-spacing: .1em !important;
-      text-transform: uppercase !important;
+      letter-spacing: -0.01em !important;
       flex-shrink: 0 !important;
+      font-family: var(--ov-font-family,'IBM Plex Sans',system-ui,sans-serif) !important;
     }
-    .ov-count-badge {
-      font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      color: var(--ov-text-faint) !important;
-      background: var(--ov-bg-3) !important;
-      border: 1px solid var(--ov-border) !important;
-      padding: 1px 5px !important;
-      border-radius: 2px !important;
-      font-weight: 700 !important;
-      flex-shrink: 0 !important;
-    }
-    .ov-hdr-spacer { flex: 1 !important; }
-    .ov-divider {
-      width: 1px !important;
-      height: 14px !important;
-      background: var(--ov-border) !important;
-      flex-shrink: 0 !important;
-    }
-    #ov-actions { display: flex !important; align-items: center !important; gap: 2px !important; }
-    #ov-actions button {
-      all: unset !important;
-      background: transparent !important;
-      color: var(--ov-text-muted) !important;
-      padding: 3px 7px !important;
-      border-radius: 2px !important;
-      cursor: pointer !important;
+    .ov-live {
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 6px !important;
+      padding: 2px 8px !important;
+      border-radius: 20px !important;
+      background: rgba(78,201,165,.12) !important;
+      border: 1px solid rgba(78,201,165,.25) !important;
+      color: var(--ov-s-2xx) !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
-      font-family: inherit !important;
-      white-space: nowrap !important;
-      border: 1px solid transparent !important;
-      transition: color 80ms, border-color 80ms !important;
+      font-weight: 500 !important;
+      flex-shrink: 0 !important;
+      font-variant-numeric: tabular-nums !important;
     }
-    #ov-actions button:hover { color: var(--ov-text) !important; border-color: var(--ov-border) !important; }
-    #ov-actions button.ov-active { color: var(--ov-accent) !important; border-color: var(--ov-accent) !important; }
+    .ov-live-dot {
+      width: 6px !important;
+      height: 6px !important;
+      border-radius: 50% !important;
+      background: var(--ov-s-2xx) !important;
+      animation: ov-pulse 1.6s infinite !important;
+      flex-shrink: 0 !important;
+      display: inline-block !important;
+    }
+    #ov-panel.ov-paused .ov-live {
+      background: rgba(217,164,65,.12) !important;
+      border-color: rgba(217,164,65,.3) !important;
+      color: var(--ov-s-4xx) !important;
+    }
+    #ov-panel.ov-paused .ov-live-dot { background: var(--ov-s-4xx) !important; animation: none !important; }
 
-    /* ── Filter row ── */
-    #ov-filter-row {
-      padding: 6px 8px !important;
+    /* ── Segmented view switch ── */
+    .ov-views {
+      display: flex !important;
+      gap: 2px !important;
       background: var(--ov-bg-2) !important;
-      border-bottom: 1px solid var(--ov-border) !important;
+      border: 1px solid var(--ov-border) !important;
+      border-radius: 8px !important;
+      padding: 2px !important;
       flex-shrink: 0 !important;
     }
+    .ov-view {
+      all: unset !important;
+      cursor: pointer !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 5px !important;
+      padding: 4px 11px !important;
+      border-radius: var(--ov-r) !important;
+      font-family: var(--ov-font-family,'IBM Plex Sans',system-ui,sans-serif) !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-text-muted) !important;
+      white-space: nowrap !important;
+      transition: background 90ms, color 90ms !important;
+    }
+    .ov-view:hover { color: var(--ov-text-dim) !important; }
+    .ov-view.on {
+      background: var(--ov-border) !important;
+      color: var(--ov-title) !important;
+      font-weight: 600 !important;
+    }
+    #ov-panel[data-theme="light"] .ov-view.on { background: #ffffff !important; box-shadow: 0 1px 2px rgba(20,30,50,.12) !important; }
+    .ov-view-n {
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
+      font-weight: 700 !important;
+      color: var(--ov-text-dim) !important;
+    }
+    .ov-view-n[hidden] { display: none !important; }
+
+    /* ── Search ── */
     .ov-search {
       display: flex !important;
       align-items: center !important;
-      background: var(--ov-bg-3) !important;
+      gap: 7px !important;
+      flex: 1 1 90px !important;
+      min-width: 62px !important;
+      height: 30px !important;
+      background: var(--ov-bg-2) !important;
       border: 1px solid var(--ov-border) !important;
-      border-radius: 2px !important;
-      padding: 0 4px !important;
+      border-radius: 8px !important;
+      padding: 0 6px 0 9px !important;
     }
+    .ov-search:focus-within { border-color: var(--ov-accent-bd) !important; }
     .ov-prompt {
-      color: var(--ov-text-muted) !important;
-      font-size: calc(13px * var(--ov-font-scale,1)) !important;
-      padding: 0 4px !important;
+      color: var(--ov-text-faint) !important;
+      font-size: calc(12px * var(--ov-font-scale,1)) !important;
       flex-shrink: 0 !important;
     }
     #ov-filter {
       all: unset !important;
       flex: 1 !important;
+      min-width: 0 !important;
       color: var(--ov-text) !important;
       font-size: calc(11px * var(--ov-font-scale,1)) !important;
       font-family: inherit !important;
-      padding: 5px 4px !important;
     }
-    #ov-filter::placeholder { color: var(--ov-text-faint) !important; }
+    #ov-filter::placeholder { color: var(--ov-text-ghost) !important; }
     #ov-filter.ov-filter-invalid { color: var(--ov-s-err) !important; }
-    .ov-search-modes { display: flex !important; gap: 2px !important; padding: 0 2px !important; }
+    .ov-hits {
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-text-faint) !important;
+      white-space: nowrap !important;
+      flex-shrink: 0 !important;
+    }
+    .ov-search-modes { display: flex !important; gap: 2px !important; flex-shrink: 0 !important; }
     .ov-modebtn {
       all: unset !important;
       cursor: pointer !important;
-      padding: 2px 5px !important;
+      padding: 2px 6px !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
-      font-weight: 700 !important;
+      font-weight: 600 !important;
       font-family: inherit !important;
       color: var(--ov-text-faint) !important;
-      border-radius: 2px !important;
-      border: 1px solid transparent !important;
+      background: var(--ov-bg-3) !important;
+      border-radius: var(--ov-r-sm) !important;
     }
-    .ov-modebtn:hover { color: var(--ov-text-muted) !important; }
-    .ov-modebtn.ov-active { color: var(--ov-accent) !important; border-color: var(--ov-accent) !important; }
+    .ov-modebtn:hover { color: var(--ov-text-dim) !important; }
+    .ov-modebtn.ov-active {
+      color: var(--ov-text-dim) !important;
+      background: var(--ov-border) !important;
+    }
 
-    /* ── Chips ── */
-    #ov-chips {
+    /* ── Filters button ── */
+    .ov-filters-btn {
+      all: unset !important;
+      cursor: pointer !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 6px !important;
+      padding: 5px 9px !important;
+      border-radius: 8px !important;
+      border: 1px solid var(--ov-border) !important;
+      background: var(--ov-bg-2) !important;
+      color: var(--ov-text-muted) !important;
+      font-family: var(--ov-font-family,'IBM Plex Sans',system-ui,sans-serif) !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      font-weight: 600 !important;
+      white-space: nowrap !important;
+      flex-shrink: 0 !important;
+    }
+    .ov-filters-btn:hover { color: var(--ov-text-dim) !important; }
+    .ov-filters-btn.on,
+    .ov-filters-btn.ov-has-filters {
+      background: var(--ov-accent-bg) !important;
+      border-color: var(--ov-accent-bd) !important;
+      color: var(--ov-accent-soft) !important;
+    }
+    .ov-filters-n {
+      background: var(--ov-accent) !important;
+      color: var(--ov-mark-fg) !important;
+      border-radius: 10px !important;
+      padding: 0 5px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
+      font-weight: 700 !important;
+    }
+    .ov-filters-n[hidden] { display: none !important; }
+    .ov-filters-caret { font-size: calc(9px * var(--ov-font-scale,1)) !important; }
+
+    /* ── Icon actions ── */
+    #ov-actions { display: flex !important; align-items: center !important; gap: 3px !important; flex-shrink: 0 !important; }
+    #ov-actions button {
+      all: unset !important;
+      width: 26px !important;
+      height: 26px !important;
       display: flex !important;
       align-items: center !important;
-      gap: 3px !important;
-      padding: 4px 8px !important;
-      background: var(--ov-bg) !important;
-      border-bottom: 1px solid var(--ov-border) !important;
-      flex-shrink: 0 !important;
-      flex-wrap: wrap !important;
+      justify-content: center !important;
+      border-radius: var(--ov-r) !important;
+      border: 1px solid var(--ov-border) !important;
+      background: var(--ov-bg-3) !important;
+      color: var(--ov-text-dim) !important;
+      cursor: pointer !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      font-family: inherit !important;
+      transition: color 90ms, border-color 90ms, background 90ms !important;
     }
+    #ov-actions button:hover {
+      color: var(--ov-title) !important;
+      border-color: var(--ov-text-faint) !important;
+    }
+    #ov-actions button.ov-active {
+      color: var(--ov-accent) !important;
+      border-color: var(--ov-accent-bd) !important;
+      background: var(--ov-accent-bg) !important;
+    }
+
+    /* ══ Settings menu ══════════════════════════════════════════════════════ */
+    .ov-menu {
+      position: absolute !important;
+      top: 42px !important;
+      right: 10px !important;
+      z-index: 6 !important;
+      min-width: 150px !important;
+      background: var(--ov-bg-3) !important;
+      border: 1px solid var(--ov-border) !important;
+      border-radius: var(--ov-r-lg) !important;
+      box-shadow: var(--ov-shadow-pop) !important;
+      padding: 4px !important;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 1px !important;
+      animation: ov-fadein .12s ease !important;
+    }
+    .ov-menu[hidden] { display: none !important; }
+    .ov-menu-item {
+      all: unset !important;
+      cursor: pointer !important;
+      display: flex !important;
+      align-items: center !important;
+      gap: 9px !important;
+      padding: 7px 10px !important;
+      border-radius: var(--ov-r) !important;
+      font-family: var(--ov-font-family,'IBM Plex Sans',system-ui,sans-serif) !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-text-dim) !important;
+      white-space: nowrap !important;
+    }
+    .ov-menu-item:hover { background: var(--ov-bg-2) !important; color: var(--ov-title) !important; }
+    .ov-menu-danger { color: var(--ov-s-err) !important; }
+    .ov-menu-danger:hover { background: rgba(229,97,94,.1) !important; color: var(--ov-s-err) !important; }
+    .ov-menu-ico { width: 14px !important; text-align: center !important; flex-shrink: 0 !important; }
+
+    /* ══ Filters popover ════════════════════════════════════════════════════ */
+    #ov-chips {
+      position: absolute !important;
+      top: 46px !important;
+      right: 10px !important;
+      z-index: 5 !important;
+      width: 262px !important;
+      max-width: calc(100% - 20px) !important;
+      background: var(--ov-bg-3) !important;
+      border: 1px solid var(--ov-border) !important;
+      border-radius: var(--ov-r-lg) !important;
+      box-shadow: var(--ov-shadow-pop) !important;
+      padding: 11px 12px !important;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 11px !important;
+      animation: ov-fadein .12s ease !important;
+    }
+    #ov-chips[hidden] { display: none !important; }
+    .ov-chip-group { display: flex !important; flex-direction: column !important; gap: 6px !important; }
     .ov-chip-label {
       font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      letter-spacing: .06em !important;
+      letter-spacing: .08em !important;
       text-transform: uppercase !important;
       color: var(--ov-text-faint) !important;
-      padding: 0 2px !important;
-      flex-shrink: 0 !important;
     }
+    .ov-chip-set { display: flex !important; gap: 5px !important; flex-wrap: wrap !important; }
     .ov-chip {
       all: unset !important;
       cursor: pointer !important;
-      font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      font-weight: 700 !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      font-weight: 600 !important;
       font-family: inherit !important;
-      letter-spacing: .04em !important;
-      padding: 2px 6px !important;
-      border-radius: 2px !important;
+      padding: 3px 9px !important;
+      border-radius: var(--ov-r) !important;
       border: 1px solid var(--ov-border) !important;
       color: var(--ov-text-muted) !important;
-      background: transparent !important;
+      background: var(--ov-bg-2) !important;
       white-space: nowrap !important;
-      transition: color 80ms, border-color 80ms, background 80ms !important;
+      transition: color 90ms, border-color 90ms, background 90ms !important;
     }
-    .ov-chip:hover { border-color: var(--ov-text-muted) !important; color: var(--ov-text) !important; }
-    .ov-chip.on { border-color: var(--ov-accent) !important; color: var(--ov-accent) !important; background: var(--ov-accent-bg) !important; }
-    .ov-chip[data-s="2xx"].on { color: var(--ov-s-2xx) !important; border-color: var(--ov-s-2xx) !important; }
-    .ov-chip[data-s="4xx"].on { color: var(--ov-s-4xx) !important; border-color: var(--ov-s-4xx) !important; }
-    .ov-chip[data-s="5xx"].on { color: var(--ov-s-5xx) !important; border-color: var(--ov-s-5xx) !important; }
+    .ov-chip-pill { border-radius: 20px !important; }
+    .ov-chip-wide { flex: 1 !important; text-align: center !important; }
+    .ov-chip:hover { color: var(--ov-text-dim) !important; border-color: var(--ov-text-faint) !important; }
+    .ov-chip.on {
+      border-color: var(--ov-accent-bd) !important;
+      color: var(--ov-accent-soft) !important;
+      background: var(--ov-accent-bg) !important;
+    }
+    .ov-chip[data-s="2xx"].on { color: var(--ov-s-2xx) !important; border-color: var(--ov-s-2xx) !important; background: rgba(78,201,165,.14) !important; }
+    .ov-chip[data-s="3xx"].on { color: var(--ov-s-3xx) !important; border-color: var(--ov-s-3xx) !important; background: rgba(84,184,200,.14) !important; }
+    .ov-chip[data-s="4xx"].on { color: var(--ov-s-4xx) !important; border-color: var(--ov-s-4xx) !important; background: rgba(217,164,65,.14) !important; }
+    .ov-chip[data-s="5xx"].on { color: var(--ov-s-5xx) !important; border-color: var(--ov-s-5xx) !important; background: rgba(229,97,94,.14) !important; }
     .ov-chip[data-m="GET"].on    { color: var(--ov-m-get) !important;    border-color: var(--ov-m-get) !important; }
     .ov-chip[data-m="POST"].on   { color: var(--ov-m-post) !important;   border-color: var(--ov-m-post) !important; }
     .ov-chip[data-m="PUT"].on    { color: var(--ov-m-put) !important;    border-color: var(--ov-m-put) !important; }
     .ov-chip[data-m="PATCH"].on  { color: var(--ov-m-patch) !important;  border-color: var(--ov-m-patch) !important; }
     .ov-chip[data-m="DELETE"].on { color: var(--ov-m-delete) !important; border-color: var(--ov-m-delete) !important; }
     .ov-chip[data-m="WS"].on     { color: var(--ov-m-ws) !important;     border-color: var(--ov-m-ws) !important; }
-    .ov-chip-count {
-      font-size: calc(8px * var(--ov-font-scale,1)) !important;
-      margin-left: 3px !important;
-      color: var(--ov-text-faint) !important;
-    }
-    .ov-chip.on .ov-chip-count { color: inherit !important; }
-    .ov-chip-sep {
-      display: inline-block !important;
-      width: 1px !important;
-      height: 12px !important;
-      background: var(--ov-border) !important;
-      margin: 0 4px !important;
-      flex-shrink: 0 !important;
-    }
+    .ov-chip-count { font-size: calc(9px * var(--ov-font-scale,1)) !important; margin-left: 4px !important; opacity: .7 !important; }
 
-    /* ── List ── */
+    /* ══ Log ════════════════════════════════════════════════════════════════ */
     #ov-list {
       overflow-y: auto !important;
-      flex: 1 !important;
-      padding: 0 !important;
+      flex: 1 1 auto !important;
+      min-height: 0 !important;
+      background: var(--ov-log) !important;
     }
-    #ov-list::-webkit-scrollbar { width: 10px !important; }
-    #ov-list::-webkit-scrollbar-track { background: var(--ov-bg) !important; }
-    #ov-list::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; border-radius: 0 !important; }
+    #ov-list::-webkit-scrollbar { width: 9px !important; }
+    #ov-list::-webkit-scrollbar-track { background: transparent !important; }
+    #ov-list::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; border-radius: 6px !important; }
 
-    /* ── Rows ── */
-    .ov-row {
+    /* Row + heading share one grid so the columns line up. */
+    .ov-list-head, .ov-row {
       display: grid !important;
-      grid-template-columns: 42px 38px 52px 1fr 54px !important;
+      grid-template-columns: 50px minmax(0,1fr) 130px 40px 54px 46px !important;
       align-items: center !important;
-      min-height: 26px !important;
-      padding: 0 !important;
-      border-radius: 0 !important;
+    }
+    .ov-list-head {
+      position: sticky !important;
+      top: 0 !important;
+      z-index: 2 !important;
+      padding: 6px 0 !important;
+      background: var(--ov-log) !important;
+      border-bottom: 1px solid var(--ov-grid) !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
+      letter-spacing: .08em !important;
+      text-transform: uppercase !important;
+      color: var(--ov-text-ghost) !important;
+    }
+    .ov-lh { padding: 0 5px !important; white-space: nowrap !important; overflow: hidden !important; }
+    .ov-lh-method { padding-left: 12px !important; }
+    .ov-lh-status, .ov-lh-dur { text-align: right !important; }
+
+    .ov-row {
+      min-height: 30px !important;
       border-bottom: 1px solid var(--ov-grid) !important;
       background: transparent !important;
       cursor: pointer !important;
-      transition: background 80ms !important;
+      border-left: 2px solid transparent !important;
+      transition: background 90ms !important;
     }
     .ov-row:hover { background: var(--ov-bg-2) !important; }
     .ov-row.ov-expanded {
-      grid-template-rows: 26px auto !important;
-      min-height: auto !important;
-      height: auto !important;
-      background: var(--ov-bg-2) !important;
-      box-shadow: inset 2px 0 0 var(--ov-accent) !important;
-      align-items: start !important;
+      background: var(--ov-accent-bg) !important;
+      border-left-color: var(--ov-accent) !important;
     }
-    .ov-row.ov-pinned:not(.ov-expanded) { box-shadow: inset 2px 0 0 var(--ov-m-patch) !important; }
+    .ov-row.ov-pinned:not(.ov-expanded) { border-left-color: var(--ov-m-patch) !important; }
     .ov-row.ov-row-rev-hl {
-      background: rgba(255,90,110,.14) !important;
-      box-shadow: inset 2px 0 0 var(--ov-s-err) !important;
+      background: var(--ov-trace-bg) !important;
+      border-left-color: var(--ov-trace) !important;
     }
 
     .ov-c {
@@ -2902,14 +3489,13 @@ function injectStyles(): void {
       overflow: hidden !important;
       text-overflow: ellipsis !important;
       font-size: calc(11px * var(--ov-font-scale,1)) !important;
-      line-height: 26px !important;
+      line-height: 30px !important;
     }
     .ov-c-method {
-      font-weight: 700 !important;
-      font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      letter-spacing: .04em !important;
-      text-align: right !important;
-      padding-right: 6px !important;
+      font-weight: 600 !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      letter-spacing: .03em !important;
+      padding-left: 10px !important;
     }
     .ov-c-method.m-get    { color: var(--ov-m-get)    !important; }
     .ov-c-method.m-post   { color: var(--ov-m-post)   !important; }
@@ -2917,43 +3503,48 @@ function injectStyles(): void {
     .ov-c-method.m-patch  { color: var(--ov-m-patch)  !important; }
     .ov-c-method.m-delete { color: var(--ov-m-delete) !important; }
     .ov-c-method.m-ws     { color: var(--ov-m-ws)     !important; }
-    .ov-c-status {
-      font-weight: 700 !important;
+    .ov-c-url { display: flex !important; align-items: center !important; gap: 6px !important; }
+    .ov-init-dot {
+      width: 6px !important;
+      height: 6px !important;
+      border-radius: 50% !important;
+      background: var(--ov-trace) !important;
+      flex: none !important;
+    }
+    .ov-init-dot.ov-init-bg { background: var(--ov-text-ghost) !important; }
+    .ov-url-path { color: var(--ov-text-dim) !important; overflow: hidden !important; text-overflow: ellipsis !important; }
+    .ov-row.ov-expanded .ov-url-path { color: var(--ov-title) !important; }
+    .ov-fr { font-size: calc(9px * var(--ov-font-scale,1)) !important; color: var(--ov-m-ws) !important; flex-shrink: 0 !important; }
+    .ov-c-init {
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-trace) !important;
+    }
+    .ov-c-init.ov-init-bg { color: var(--ov-text-ghost) !important; }
+    .ov-c-status {
+      font-weight: 600 !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      text-align: right !important;
     }
     .ov-c-status.s-2xx     { color: var(--ov-s-2xx) !important; }
     .ov-c-status.s-3xx     { color: var(--ov-s-3xx) !important; }
     .ov-c-status.s-4xx     { color: var(--ov-s-4xx) !important; }
     .ov-c-status.s-5xx     { color: var(--ov-s-5xx) !important; }
     .ov-c-status.s-err     { color: var(--ov-s-err) !important; }
-    .ov-c-status.s-pending { color: var(--ov-s-pending) !important; }
+    .ov-c-status.s-pending { color: var(--ov-s-pending) !important; animation: ov-pulse 1.4s infinite !important; }
     .ov-c-dur {
-      color: var(--ov-text-muted) !important;
+      color: var(--ov-text-faint) !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
       font-variant-numeric: tabular-nums !important;
+      text-align: right !important;
     }
-    .ov-c-url { flex: 1 !important; display: flex !important; align-items: center !important; gap: 4px !important; }
-    .ov-url-path { color: var(--ov-text-dim) !important; overflow: hidden !important; text-overflow: ellipsis !important; }
-    .ov-fr { font-size: calc(9px * var(--ov-font-scale,1)) !important; color: var(--ov-m-ws) !important; flex-shrink: 0 !important; }
-    .ov-init {
-      font-size: calc(8px * var(--ov-font-scale,1)) !important;
-      color: var(--ov-text-muted) !important;
-      border: 1px solid var(--ov-border) !important;
-      padding: 0 3px !important;
-      text-transform: uppercase !important;
-      letter-spacing: .04em !important;
-      flex-shrink: 0 !important;
-      border-radius: 1px !important;
-    }
-    .ov-init-bg { color: var(--ov-text-faint) !important; }
-.ov-c-act {
+    .ov-c-act {
       display: flex !important;
-      gap: 3px !important;
+      gap: 2px !important;
       align-items: center !important;
       justify-content: flex-end !important;
       padding-right: 6px !important;
       opacity: 0 !important;
-      transition: opacity 80ms !important;
+      transition: opacity 90ms !important;
     }
     .ov-row:hover .ov-c-act,
     .ov-row.ov-pinned .ov-c-act { opacity: 1 !important; }
@@ -2962,111 +3553,302 @@ function injectStyles(): void {
       cursor: pointer !important;
       font-size: calc(9px * var(--ov-font-scale,1)) !important;
       font-family: inherit !important;
-      color: var(--ov-text-muted) !important;
-      padding: 1px 4px !important;
-      border-radius: 2px !important;
+      color: var(--ov-text-faint) !important;
+      padding: 2px 5px !important;
+      border-radius: var(--ov-r-sm) !important;
     }
-    .ov-pin-btn:hover, .ov-copy-btn:hover, .ov-copy-tab-btn:hover { background: var(--ov-bg-3) !important; color: var(--ov-text) !important; }
+    .ov-pin-btn:hover, .ov-copy-btn:hover, .ov-copy-tab-btn:hover {
+      background: var(--ov-bg-3) !important;
+      color: var(--ov-text) !important;
+    }
     .ov-pin-btn.on { color: var(--ov-m-patch) !important; }
 
-    /* ── Detail panel ── */
-    .ov-detail {
-      grid-column: 1 / -1 !important;
-      padding: 8px 10px !important;
-      border-top: 1px solid var(--ov-border) !important;
+    /* Narrow panel: the initiator column is the first to go, then the duration.
+       A hidden cell stops being a grid item, so each breakpoint drops the matching
+       track too — leave the counts out of step and every later column shifts. */
+    @container (max-width: 640px) {
+      .ov-hdr-title { display: none !important; }
+    }
+    /* Below this the toolbar can no longer hold every label at full size, so the
+       secondary text goes and the controls tighten — nothing is dropped. */
+    @container (max-width: 570px) {
+      #ov-header { gap: 6px !important; padding: 8px !important; }
+      .ov-view { padding: 4px 8px !important; }
+      .ov-view-n, .ov-filters-lbl { display: none !important; }
+      .ov-live { padding: 2px 6px !important; }
+    }
+    @container (max-width: 520px) {
+      .ov-list-head, .ov-row { grid-template-columns: 46px minmax(0,1fr) 40px 52px 44px !important; }
+      .ov-c-init, .ov-lh-init { display: none !important; }
+    }
+    /* At the smallest supported footprint one toolbar line cannot hold eight
+       controls, so search and filters take a second line rather than clipping. */
+    @container (max-width: 430px) {
+      #ov-header { flex-wrap: wrap !important; gap: 5px !important; padding: 7px 6px !important; }
+      #ov-actions { margin-left: auto !important; }
+      .ov-search { order: 10 !important; flex: 1 1 60% !important; }
+      .ov-filters-btn { order: 11 !important; }
+      #ov-chips, .ov-menu { top: 76px !important; }
+      .ov-view { padding: 4px 8px !important; }
+    }
+    @container (max-width: 400px) {
+      .ov-list-head, .ov-row { grid-template-columns: 42px minmax(0,1fr) 38px 40px !important; }
+      .ov-c-dur, .ov-lh-dur { display: none !important; }
+      #ov-dock { max-height: 66% !important; }
+    }
+
+    /* ══ Docked inspector ═══════════════════════════════════════════════════ */
+    #ov-dock {
+      flex: 0 0 auto !important;
+      max-height: 58% !important;
       display: flex !important;
       flex-direction: column !important;
-      gap: 0 !important;
+      overflow: hidden !important;
+      background: var(--ov-bg) !important;
+      border-top: 2px solid var(--ov-border) !important;
     }
-    .ov-detail-section { margin-bottom: 8px !important; }
+    #ov-dock[hidden] { display: none !important; }
+    .ov-detail {
+      display: flex !important;
+      flex-direction: column !important;
+      flex: 1 1 auto !important;
+      min-height: 0 !important;
+      overflow: hidden !important;
+    }
+
+    /* ── Detail head ── */
+    .ov-dh { padding: 10px 12px 9px !important; border-bottom: 1px solid var(--ov-border-soft) !important; flex-shrink: 0 !important; }
+    .ov-dh-top { display: flex !important; align-items: center !important; gap: 8px !important; margin-bottom: 7px !important; }
+    .ov-dh-method {
+      padding: 2px 8px !important;
+      border-radius: var(--ov-r) !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      font-weight: 700 !important;
+      background: var(--ov-bg-3) !important;
+      flex-shrink: 0 !important;
+    }
+    .ov-dh-method.m-get    { color: var(--ov-m-get)    !important; }
+    .ov-dh-method.m-post   { color: var(--ov-m-post)   !important; background: rgba(76,157,255,.16) !important; }
+    .ov-dh-method.m-put    { color: var(--ov-m-put)    !important; }
+    .ov-dh-method.m-patch  { color: var(--ov-m-patch)  !important; }
+    .ov-dh-method.m-delete { color: var(--ov-m-delete) !important; }
+    .ov-dh-method.m-ws     { color: var(--ov-m-ws)     !important; background: rgba(183,139,255,.16) !important; }
+    .ov-dh-status {
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      font-weight: 600 !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 5px !important;
+      flex-shrink: 0 !important;
+    }
+    .ov-dh-status.s-2xx     { color: var(--ov-s-2xx) !important; }
+    .ov-dh-status.s-3xx     { color: var(--ov-s-3xx) !important; }
+    .ov-dh-status.s-4xx     { color: var(--ov-s-4xx) !important; }
+    .ov-dh-status.s-5xx     { color: var(--ov-s-5xx) !important; }
+    .ov-dh-status.s-err     { color: var(--ov-s-err) !important; }
+    .ov-dh-status.s-pending { color: var(--ov-s-pending) !important; }
+    .ov-spinner {
+      width: 9px !important;
+      height: 9px !important;
+      border: 2px solid var(--ov-border) !important;
+      border-top-color: var(--ov-accent) !important;
+      border-radius: 50% !important;
+      display: inline-block !important;
+      animation: ov-spin .7s linear infinite !important;
+      flex-shrink: 0 !important;
+    }
+    .ov-dh-meta { font-size: calc(10px * var(--ov-font-scale,1)) !important; color: var(--ov-text-muted) !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; }
+    .ov-dh-spacer { flex: 1 !important; }
+    .ov-dh-pin, .ov-dh-close {
+      all: unset !important;
+      cursor: pointer !important;
+      font-family: inherit !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-text-muted) !important;
+      border: 1px solid var(--ov-border) !important;
+      background: var(--ov-bg-3) !important;
+      border-radius: var(--ov-r) !important;
+      padding: 3px 8px !important;
+      flex-shrink: 0 !important;
+      opacity: 1 !important;
+    }
+    .ov-dh-pin:hover, .ov-dh-close:hover { color: var(--ov-title) !important; border-color: var(--ov-text-faint) !important; }
+    .ov-dh-pin.on { color: var(--ov-m-patch) !important; border-color: var(--ov-m-patch) !important; }
+    .ov-dh-url {
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-text-muted) !important;
+      word-break: break-all !important;
+      line-height: 1.5 !important;
+    }
+    .ov-dh-path { color: var(--ov-title) !important; font-weight: 600 !important; }
+    .ov-dh-trigger {
+      all: unset !important;
+      display: flex !important;
+      align-items: center !important;
+      gap: 8px !important;
+      margin-top: 8px !important;
+      padding: 5px 9px !important;
+      border-radius: var(--ov-r) !important;
+      background: var(--ov-trace-bg) !important;
+      border: 1px solid var(--ov-trace-bd) !important;
+      font-family: inherit !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      cursor: pointer !important;
+      box-sizing: border-box !important;
+      width: 100% !important;
+      overflow: hidden !important;
+    }
+    .ov-dh-trigger-bg {
+      background: var(--ov-bg-2) !important;
+      border-color: var(--ov-border) !important;
+      cursor: default !important;
+    }
+    .ov-dh-trigger-lbl { color: var(--ov-trace) !important; flex-shrink: 0 !important; }
+    .ov-dh-trigger-bg .ov-dh-trigger-lbl { color: var(--ov-text-faint) !important; }
+    .ov-dh-trigger-el {
+      color: var(--ov-title) !important;
+      background: var(--ov-bg-3) !important;
+      padding: 1px 6px !important;
+      border-radius: 4px !important;
+      overflow: hidden !important;
+      text-overflow: ellipsis !important;
+      white-space: nowrap !important;
+      min-width: 0 !important;
+    }
+    .ov-dh-trigger-hint { color: var(--ov-text-ghost) !important; flex-shrink: 0 !important; margin-left: auto !important; }
+    .ov-dh-trigger:hover .ov-dh-trigger-hint { color: var(--ov-accent-soft) !important; }
+
+    /* ── Detail tabs ── */
     .ov-tabs {
       display: flex !important;
+      align-items: center !important;
       gap: 2px !important;
-      margin-bottom: 8px !important;
-      border-bottom: 1px solid var(--ov-border) !important;
+      padding: 6px 10px 0 !important;
+      border-bottom: 1px solid var(--ov-border-soft) !important;
+      flex-shrink: 0 !important;
     }
     .ov-tab {
       all: unset !important;
       cursor: pointer !important;
-      padding: 4px 10px !important;
-      font-size: calc(10px * var(--ov-font-scale,1)) !important;
-      font-weight: 700 !important;
-      letter-spacing: .04em !important;
+      padding: 5px 10px !important;
+      font-size: calc(10.5px * var(--ov-font-scale,1)) !important;
       color: var(--ov-text-muted) !important;
       border-bottom: 2px solid transparent !important;
       font-family: inherit !important;
-      text-transform: uppercase !important;
+      text-transform: capitalize !important;
     }
-    .ov-tab:hover { color: var(--ov-text) !important; }
-    .ov-tab.ov-tab-active { color: var(--ov-accent) !important; border-bottom-color: var(--ov-accent) !important; }
+    .ov-tab:hover { color: var(--ov-text-dim) !important; }
+    .ov-tab.ov-tab-active {
+      color: var(--ov-title) !important;
+      font-weight: 600 !important;
+      border-bottom-color: var(--ov-accent) !important;
+    }
+    .ov-tab-spacer { flex: 1 !important; }
+
+    /* ── Detail panes ── */
+    .ov-panel {
+      padding: 10px 12px !important;
+      overflow-y: auto !important;
+      flex: 1 1 auto !important;
+      min-height: 0 !important;
+    }
+    .ov-panel::-webkit-scrollbar { width: 9px !important; }
+    .ov-panel::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; border-radius: 6px !important; }
+    .ov-detail-section { margin-bottom: 10px !important; }
     .ov-detail-label {
       font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      font-weight: 700 !important;
-      color: var(--ov-text-muted) !important;
-      letter-spacing: .06em !important;
+      font-weight: 600 !important;
+      color: var(--ov-text-faint) !important;
+      letter-spacing: .08em !important;
       text-transform: uppercase !important;
-      margin-bottom: 4px !important;
-    }
-    .ov-trigger-full {
-      font-size: calc(10px * var(--ov-font-scale,1)) !important;
-      color: var(--ov-text-dim) !important;
-      padding: 3px 0 !important;
+      margin-bottom: 5px !important;
     }
     .ov-hdr-table {
-      background: var(--ov-bg) !important;
-      border: 1px solid var(--ov-border) !important;
-      border-radius: 2px !important;
-      padding: 2px 0 !important;
+      background: var(--ov-bg-2) !important;
+      border: 1px solid var(--ov-border-soft) !important;
+      border-radius: var(--ov-r) !important;
+      padding: 3px 0 !important;
       max-height: 180px !important;
       overflow-y: auto !important;
     }
     .ov-hdr-table::-webkit-scrollbar { width: 8px !important; }
-    .ov-hdr-table::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; }
+    .ov-hdr-table::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; border-radius: 6px !important; }
     .ov-hdr-row {
       display: flex !important;
       gap: 8px !important;
-      padding: 2px 8px !important;
+      padding: 3px 9px !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
-      line-height: 1.4 !important;
+      line-height: 1.45 !important;
     }
-    .ov-hdr-row:hover { background: var(--ov-bg-2) !important; }
+    .ov-hdr-row:hover { background: var(--ov-bg-3) !important; }
     .ov-hdr-name {
-      color: var(--ov-accent) !important;
-      font-weight: 700 !important;
+      color: var(--ov-accent-soft) !important;
+      font-weight: 600 !important;
       flex-shrink: 0 !important;
       min-width: 110px !important;
       max-width: 180px !important;
       word-break: break-all !important;
     }
-    .ov-hdr-val { color: var(--ov-text-dim) !important; word-break: break-all !important; flex: 1 !important; }
+    .ov-hdr-val { color: var(--ov-text-muted) !important; word-break: break-all !important; flex: 1 !important; }
     .ov-body-pre {
       all: unset !important;
       display: block !important;
-      background: var(--ov-bg) !important;
-      border: 1px solid var(--ov-border) !important;
-      border-radius: 2px !important;
-      padding: 6px 8px !important;
+      background: var(--ov-bg-2) !important;
+      border: 1px solid var(--ov-border-soft) !important;
+      border-radius: var(--ov-r) !important;
+      padding: 8px 9px !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
       font-family: inherit !important;
-      color: var(--ov-s-2xx) !important;
+      color: var(--ov-text-dim) !important;
       white-space: pre-wrap !important;
       word-break: break-all !important;
-      max-height: 150px !important;
+      max-height: 190px !important;
       overflow-y: auto !important;
     }
     .ov-body-pre::-webkit-scrollbar { width: 8px !important; }
-    .ov-body-pre::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; }
+    .ov-body-pre::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; border-radius: 6px !important; }
     .ov-trunc-note {
-      font-size: calc(9px * var(--ov-font-scale,1)) !important;
+      font-size: calc(9.5px * var(--ov-font-scale,1)) !important;
       color: var(--ov-s-4xx) !important;
-      margin-bottom: 4px !important;
-      letter-spacing: .02em !important;
+      background: rgba(217,164,65,.10) !important;
+      border: 1px solid rgba(217,164,65,.3) !important;
+      border-radius: var(--ov-r) !important;
+      padding: 5px 8px !important;
+      margin-bottom: 7px !important;
     }
+    .ov-body-bar {
+      display: flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+      gap: 8px !important;
+      margin-bottom: 7px !important;
+    }
+    .ov-body-meta { font-size: calc(9.5px * var(--ov-font-scale,1)) !important; color: var(--ov-text-faint) !important; }
+    .ov-reveal-all {
+      all: unset !important;
+      cursor: pointer !important;
+      font-family: inherit !important;
+      font-size: calc(9.5px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-s-2xx) !important;
+      background: rgba(78,201,165,.1) !important;
+      border: 1px solid rgba(78,201,165,.25) !important;
+      padding: 3px 9px !important;
+      border-radius: 20px !important;
+      text-align: center !important;
+    }
+    .ov-reveal-all:hover { background: rgba(78,201,165,.18) !important; }
+    .ov-reveal-all.on {
+      color: var(--ov-trace) !important;
+      background: var(--ov-trace-bg) !important;
+      border-color: var(--ov-trace-bd) !important;
+    }
+
+    /* ── JSON tree ── */
     .ov-body-json {
       display: block !important;
-      background: var(--ov-bg) !important;
-      border: 1px solid var(--ov-border) !important;
-      border-radius: 2px !important;
+      background: var(--ov-bg-2) !important;
+      border: 1px solid var(--ov-border-soft) !important;
+      border-radius: var(--ov-r) !important;
       padding: 6px 8px !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
       font-family: inherit !important;
@@ -3096,114 +3878,190 @@ function injectStyles(): void {
       overflow: visible !important;
       font-family: inherit !important;
     }
-    .ov-body-json::-webkit-scrollbar { width: 8px !important; height: 8px !important; }
-    .ov-body-json::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; }
-    .ov-jk { color: var(--ov-accent) !important; }
-    .ov-jv { cursor: pointer !important; border-radius: 1px !important; padding: 0 1px !important; transition: background .1s !important; }
-    .ov-jv-string  { color: #89d182 !important; }
-    .ov-jv-number  { color: #f78c6c !important; }
-    .ov-jv-boolean { color: #b58cff !important; }
-    .ov-jv-null    { color: #b58cff !important; font-style: italic !important; }
-    #ov-panel[data-theme="light"] .ov-jk { color: var(--ov-accent) !important; }
-    #ov-panel[data-theme="light"] .ov-jv-string  { color: #2e7d32 !important; }
-    #ov-panel[data-theme="light"] .ov-jv-number  { color: #b8541d !important; }
-    #ov-panel[data-theme="light"] .ov-jv-boolean { color: #7a3df0 !important; }
-    #ov-panel[data-theme="light"] .ov-jv-null    { color: #7a3df0 !important; }
+    .ov-body-json::-webkit-scrollbar { width: 9px !important; height: 9px !important; }
+    .ov-body-json::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; border-radius: 6px !important; }
+    .ov-jk { color: #7fb1ff !important; }
+    .ov-jv { cursor: pointer !important; border-radius: 3px !important; padding: 0 2px !important; transition: background .1s !important; }
+    .ov-jv-string  { color: #e6c07b !important; }
+    .ov-jv-number  { color: #7ee0a1 !important; }
+    .ov-jv-boolean { color: #b78bff !important; }
+    .ov-jv-null    { color: #b78bff !important; font-style: italic !important; }
+    #ov-panel[data-theme="light"] .ov-jk { color: #1d4ed8 !important; }
+    #ov-panel[data-theme="light"] .ov-jv-string  { color: #a16207 !important; }
+    #ov-panel[data-theme="light"] .ov-jv-number  { color: #15803d !important; }
+    #ov-panel[data-theme="light"] .ov-jv-boolean { color: #7c3aed !important; }
+    #ov-panel[data-theme="light"] .ov-jv-null    { color: #7c3aed !important; }
     .ov-jv:hover { background: var(--ov-accent-bg) !important; }
-    .ov-jv.ov-jv-active { background: rgba(255,90,110,.2) !important; box-shadow: inset 0 0 0 1px var(--ov-s-err) !important; }
-    .ov-jv-trunc { color: var(--ov-text-faint) !important; font-style: italic !important; }
-    .ov-body-none { font-size: calc(10px * var(--ov-font-scale,1)) !important; color: var(--ov-text-faint) !important; font-style: italic !important; }
-    .ov-value-status {
-      display: inline-block !important;
-      margin-left: 6px !important;
-      padding: 0 6px !important;
-      background: var(--ov-s-err) !important;
-      color: #fff !important;
-      border-radius: 2px !important;
-      font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      font-weight: 700 !important;
-      vertical-align: middle !important;
+    .ov-jv.ov-jv-active {
+      background: var(--ov-trace-bg) !important;
+      box-shadow: 0 0 0 1px var(--ov-trace-bd) !important;
     }
-    .ov-value-status[data-empty="1"] { background: var(--ov-text-faint) !important; }
+    .ov-jv-trunc { color: var(--ov-text-ghost) !important; font-style: italic !important; }
+    .ov-body-none { font-size: calc(10px * var(--ov-font-scale,1)) !important; color: var(--ov-text-ghost) !important; font-style: italic !important; }
 
-    /* ── WS ── */
-    .ov-ws-thread { max-height: 200px !important; overflow-y: auto !important; }
-    .ov-ws-thread::-webkit-scrollbar { width: 8px !important; }
-    .ov-ws-thread::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; }
-    .ov-ws-msg { display: flex !important; gap: 6px !important; margin: 3px 0 !important; align-items: flex-start !important; }
-    .ov-ws-dir { font-size: calc(9px * var(--ov-font-scale,1)) !important; font-weight: 700 !important; padding: 1px 4px !important; border-radius: 1px !important; flex-shrink: 0 !important; }
-    .ov-ws-sent .ov-ws-dir { background: rgba(78,201,176,.15) !important; color: var(--ov-m-ws) !important; }
-    .ov-ws-recv .ov-ws-dir { background: var(--ov-accent-bg) !important; color: var(--ov-accent) !important; }
-    .ov-ws-body { all: unset !important; display: block !important; font-size: calc(10px * var(--ov-font-scale,1)) !important; font-family: inherit !important; color: var(--ov-text-dim) !important; white-space: pre-wrap !important; word-break: break-all !important; flex: 1 !important; }
-    .ov-ws-t { font-size: calc(9px * var(--ov-font-scale,1)) !important; color: var(--ov-text-faint) !important; flex-shrink: 0 !important; margin-top: 1px !important; }
-
-    /* ── Tab spacer & pane containers ── */
-    .ov-tab-spacer { flex: 1 !important; }
-    .ov-panel { padding: 4px 0 !important; }
+    /* ── Timing ── */
     .ov-kv {
       display: grid !important;
-      grid-template-columns: 80px 1fr !important;
-      gap: 2px 8px !important;
+      grid-template-columns: 88px 1fr !important;
+      gap: 3px 10px !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
-      padding: 4px 2px !important;
     }
     .ov-kv-k {
-      color: var(--ov-text-muted) !important;
-      font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      font-weight: 700 !important;
-      letter-spacing: .04em !important;
-      text-transform: uppercase !important;
-      padding: 2px 0 !important;
-    }
-    .ov-kv-v {
-      color: var(--ov-text) !important;
-      font-weight: 700 !important;
-      padding: 2px 0 !important;
-    }
-
-    /* ── Empty ── */
-    .ov-empty {
       color: var(--ov-text-faint) !important;
-      text-align: center !important;
-      padding: 30px 10px !important;
-      line-height: 1.7 !important;
-      font-size: calc(11px * var(--ov-font-scale,1)) !important;
-    }
-
-    /* ── Pin tray ── */
-    .ov-pintray {
-      border-bottom: 1px solid var(--ov-border) !important;
-      background: var(--ov-bg-2) !important;
-    }
-    .ov-pintray-head {
       font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      font-weight: 700 !important;
+      font-weight: 600 !important;
       letter-spacing: .06em !important;
       text-transform: uppercase !important;
-      color: var(--ov-m-patch) !important;
-      padding: 4px 8px 2px !important;
+      padding: 2px 0 !important;
     }
-    .ov-pintray-empty {
+    .ov-kv-v { color: var(--ov-text) !important; font-weight: 600 !important; padding: 2px 0 !important; }
+    .ov-kv-est .ov-kv-k, .ov-kv-est .ov-kv-v { color: var(--ov-text-ghost) !important; font-weight: 400 !important; }
+    .ov-timing-note {
+      display: flex !important;
+      gap: 8px !important;
+      align-items: flex-start !important;
+      margin-top: 12px !important;
+      padding: 8px 10px !important;
+      border-radius: var(--ov-r) !important;
+      background: rgba(217,164,65,.08) !important;
+      border: 1px solid rgba(217,164,65,.28) !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
-      color: var(--ov-text-faint) !important;
-      padding: 4px 8px 6px !important;
-      font-style: italic !important;
+      color: var(--ov-s-4xx) !important;
+      line-height: 1.5 !important;
+      font-family: var(--ov-font-family,'IBM Plex Sans',system-ui,sans-serif) !important;
     }
 
-    /* ── Footer ── */
+    /* ── WebSocket frames ── */
+    .ov-ws-thread { display: flex !important; flex-direction: column !important; gap: 1px !important; }
+    .ov-ws-msg { display: flex !important; gap: 10px !important; padding: 3px 0 !important; align-items: flex-start !important; }
+    .ov-ws-dir {
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      font-weight: 700 !important;
+      flex: none !important;
+      width: 14px !important;
+      text-align: center !important;
+    }
+    .ov-ws-sent .ov-ws-dir { color: var(--ov-m-post) !important; }
+    .ov-ws-recv .ov-ws-dir { color: var(--ov-s-2xx) !important; }
+    .ov-ws-body {
+      all: unset !important;
+      display: block !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      font-family: inherit !important;
+      color: var(--ov-text-dim) !important;
+      white-space: pre-wrap !important;
+      word-break: break-all !important;
+      flex: 1 !important;
+    }
+    .ov-ws-t {
+      font-size: calc(9.5px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-text-ghost) !important;
+      flex: none !important;
+      width: 62px !important;
+      font-variant-numeric: tabular-nums !important;
+    }
+
+    /* ══ Empty / dormant states ═════════════════════════════════════════════ */
+    .ov-empty { padding: 22px 16px !important; }
+    .ov-state {
+      max-width: 320px !important;
+      margin: 0 auto !important;
+      padding: 18px 16px !important;
+      border: 1px solid var(--ov-border) !important;
+      border-radius: var(--ov-r-lg) !important;
+      background: var(--ov-bg) !important;
+      display: flex !important;
+      flex-direction: column !important;
+      font-family: var(--ov-font-family,'IBM Plex Sans',system-ui,sans-serif) !important;
+    }
+    .ov-state-idle { border-style: dashed !important; }
+    .ov-state-ico {
+      width: 32px !important;
+      height: 32px !important;
+      border-radius: 9px !important;
+      background: var(--ov-bg-3) !important;
+      border: 1px solid var(--ov-border) !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      font-size: calc(14px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-text-faint) !important;
+      margin-bottom: 12px !important;
+    }
+    .ov-state-live .ov-state-ico {
+      background: rgba(78,201,165,.1) !important;
+      border-color: rgba(78,201,165,.25) !important;
+    }
+    .ov-state-warn .ov-state-ico {
+      background: rgba(217,164,65,.1) !important;
+      border-color: rgba(217,164,65,.3) !important;
+      color: var(--ov-s-4xx) !important;
+    }
+    .ov-state-title {
+      font-size: calc(12px * var(--ov-font-scale,1)) !important;
+      font-weight: 600 !important;
+      color: var(--ov-title) !important;
+      margin-bottom: 5px !important;
+    }
+    .ov-state-body {
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-text-muted) !important;
+      line-height: 1.55 !important;
+    }
+    .ov-state-note {
+      margin-top: 12px !important;
+      font-family: var(--ov-font-family,'IBM Plex Mono',ui-monospace,monospace) !important;
+      font-size: calc(9.5px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-text-ghost) !important;
+    }
+    .ov-state-actions { display: flex !important; justify-content: center !important; padding: 0 16px 18px !important; }
+    .ov-btn-primary {
+      all: unset !important;
+      padding: 7px 18px !important;
+      border-radius: 8px !important;
+      background: var(--ov-accent) !important;
+      color: var(--ov-mark-fg) !important;
+      font-family: var(--ov-font-family,'IBM Plex Sans',system-ui,sans-serif) !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      font-weight: 600 !important;
+      cursor: pointer !important;
+    }
+    .ov-btn-primary:disabled { opacity: .4 !important; cursor: not-allowed !important; }
+
+    /* ── Site-map confidence tiers ── */
+    .ov-tier-legend {
+      display: flex !important;
+      justify-content: center !important;
+      flex-wrap: wrap !important;
+      gap: 12px !important;
+      padding: 14px 16px !important;
+      font-size: calc(9.5px * var(--ov-font-scale,1)) !important;
+    }
+    .ov-tier { display: inline-flex !important; align-items: center !important; gap: 6px !important; }
+    .ov-tier-swatch { width: 8px !important; height: 8px !important; border-radius: 2px !important; display: inline-block !important; }
+    .ov-tier-observed { color: var(--ov-s-2xx) !important; }
+    .ov-tier-observed .ov-tier-swatch { background: var(--ov-s-2xx) !important; }
+    .ov-tier-declared { color: var(--ov-s-3xx) !important; }
+    .ov-tier-declared .ov-tier-swatch { background: var(--ov-s-3xx) !important; }
+    .ov-tier-inferred { color: var(--ov-s-4xx) !important; }
+    .ov-tier-inferred .ov-tier-swatch { border: 1px dashed var(--ov-s-4xx) !important; }
+
+    /* ══ Footer ═════════════════════════════════════════════════════════════ */
     #ov-footer {
       display: flex !important;
       align-items: center !important;
-      gap: 10px !important;
-      padding: 4px 10px !important;
+      gap: 12px !important;
+      padding: 6px 12px !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
-      color: var(--ov-text-muted) !important;
+      color: var(--ov-text-faint) !important;
       border-top: 1px solid var(--ov-border) !important;
       flex-shrink: 0 !important;
-      background: var(--ov-hdr) !important;
+      background: var(--ov-hdr-flat) !important;
+      overflow: hidden !important;
+      white-space: nowrap !important;
     }
-    .ov-fstat { color: var(--ov-text-muted) !important; }
-    .ov-fstat b { color: var(--ov-text) !important; font-weight: 700 !important; }
+    .ov-fstat { color: var(--ov-text-faint) !important; }
+    .ov-fstat b { color: var(--ov-text-dim) !important; font-weight: 600 !important; }
     .ov-fstat-err b { color: var(--ov-s-err) !important; }
     .ov-fstat-warn b { color: var(--ov-s-4xx) !important; }
     .ov-fstat-btn {
@@ -3211,33 +4069,22 @@ function injectStyles(): void {
       cursor: pointer !important;
       font-family: inherit !important;
       font-size: inherit !important;
-      color: var(--ov-text-muted) !important;
-      padding: 1px 4px !important;
+      color: var(--ov-text-faint) !important;
+      padding: 1px 6px !important;
       border: 1px solid transparent !important;
-      border-radius: 2px !important;
+      border-radius: var(--ov-r-sm) !important;
     }
-    .ov-fstat-btn:hover { border-color: var(--ov-text-muted) !important; }
+    .ov-fstat-btn:hover { border-color: var(--ov-border) !important; }
     .ov-fstat-btn.on {
-      border-color: var(--ov-accent) !important;
+      border-color: var(--ov-accent-bd) !important;
       background: var(--ov-accent-bg) !important;
     }
-    .ov-fstat-btn:disabled { cursor: default !important; opacity: .55 !important; }
+    .ov-fstat-btn:disabled { cursor: default !important; opacity: .5 !important; }
     .ov-fstat-btn:disabled:hover { border-color: transparent !important; }
     .ov-fspacer { flex: 1 !important; }
-    .ov-pin-toggle {
-      all: unset !important;
-      cursor: pointer !important;
-      font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      font-family: inherit !important;
-      color: var(--ov-text-muted) !important;
-      padding: 1px 5px !important;
-      border: 1px solid var(--ov-border) !important;
-      border-radius: 2px !important;
-    }
-    .ov-pin-toggle:hover { color: var(--ov-m-patch) !important; border-color: var(--ov-m-patch) !important; }
-    .ov-pin-toggle.on { color: var(--ov-m-patch) !important; border-color: var(--ov-m-patch) !important; }
+    .ov-fnote { color: var(--ov-text-ghost) !important; overflow: hidden !important; text-overflow: ellipsis !important; }
 
-    /* ── Resize handles ── */
+    /* ══ Resize handles ═════════════════════════════════════════════════════ */
     .ov-resize-handle { position: absolute !important; z-index: 10 !important; }
     .ov-resize-handle[data-dir="n"]  { top:0 !important; left:8px !important; right:8px !important; height:5px !important; cursor:n-resize !important; }
     .ov-resize-handle[data-dir="s"]  { bottom:0 !important; left:8px !important; right:8px !important; height:5px !important; cursor:s-resize !important; }
@@ -3248,7 +4095,7 @@ function injectStyles(): void {
     .ov-resize-handle[data-dir="sw"] { bottom:0 !important; left:0 !important; width:8px !important; height:8px !important; cursor:sw-resize !important; }
     .ov-resize-handle[data-dir="se"] { bottom:0 !important; right:0 !important; width:8px !important; height:8px !important; cursor:se-resize !important; }
 
-    /* ── Pill ── */
+    /* ══ Minimized / ambient pill ═══════════════════════════════════════════ */
     #ov-pill {
       all: initial;
       position: fixed !important;
@@ -3257,226 +4104,255 @@ function injectStyles(): void {
       z-index: 2147483646 !important;
       display: flex !important;
       align-items: center !important;
-      gap: 8px !important;
-      padding: 0 14px !important;
-      height: 32px !important;
-      background: #14161a !important;
-      border: 1px solid #2a2f37 !important;
-      border-radius: 16px !important;
-      font-family: var(--ov-font-family,'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace) !important;
+      gap: 10px !important;
+      padding: 8px 12px !important;
+      background: #12161c !important;
+      border: 1px solid #2a333f !important;
+      border-radius: 12px !important;
+      font-family: var(--ov-font-family,'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace) !important;
       font-size: calc(11px * var(--ov-font-scale,1)) !important;
-      color: #d6dae0 !important;
+      color: #eef2f7 !important;
       cursor: move !important;
-      box-shadow: 0 4px 20px rgba(0,0,0,.55) !important;
+      box-shadow: 0 18px 40px -14px rgba(0,0,0,.75) !important;
       user-select: none !important;
+      --ov-mark: linear-gradient(135deg,#5b8cff,#8a5bff);
+      --ov-mark-fg: #0a0c0f;
+      --ov-r-sm: 5px;
     }
     #ov-pill[data-theme="light"] {
       background: #ffffff !important;
-      border-color: #d9d4c4 !important;
-      color: #1a1c20 !important;
-      box-shadow: 0 4px 20px rgba(0,0,0,.18) !important;
+      border-color: #dce1e8 !important;
+      color: #1c2530 !important;
+      box-shadow: 0 18px 40px -14px rgba(20,30,50,.3) !important;
+      --ov-mark: linear-gradient(135deg,#3b6fe0,#7c3aed);
+      --ov-mark-fg: #ffffff;
     }
     .ov-pill-dot {
       width: 7px !important; height: 7px !important;
       border-radius: 50% !important;
-      background: #4ec9b0 !important;
+      background: #4ec9a5 !important;
       flex-shrink: 0 !important;
+      animation: ov-pulse 1.6s infinite !important;
     }
-    .ov-pill-count { font-weight: 700 !important; font-size: calc(12px * var(--ov-font-scale,1)) !important; }
+    .ov-pill-dot.ov-pill-paused { background: #d9a441 !important; animation: none !important; }
+    .ov-pill-count { font-weight: 600 !important; font-size: calc(13px * var(--ov-font-scale,1)) !important; }
     .ov-pill-label {
-      color: #6a7180 !important;
+      color: #6b7684 !important;
       font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      font-weight: 700 !important;
+      font-weight: 600 !important;
       letter-spacing: .06em !important;
       text-transform: uppercase !important;
     }
-    .ov-pill-err { color: #ff5a6e !important; font-weight: 700 !important; font-size: calc(10px * var(--ov-font-scale,1)) !important; }
-    .ov-pill-rail { display: flex !important; gap: 2px !important; align-items: center !important; margin: 0 2px !important; }
+    .ov-pill-err { color: #e5615e !important; font-weight: 600 !important; font-size: calc(10px * var(--ov-font-scale,1)) !important; }
+    .ov-pill-rail { display: flex !important; gap: 2px !important; align-items: flex-end !important; height: 16px !important; }
     .ov-pill-tick {
-      width: 3px !important; height: 12px !important;
-      background: #2a2f37 !important;
+      width: 3px !important;
+      background: #39434f !important;
       border-radius: 1px !important;
       flex-shrink: 0 !important;
     }
-    .ov-pill-tick.ok { background: #4ec9b0 !important; }
-    .ov-pill-tick.err { background: #ff5a6e !important; }
-    .ov-pill-tick.warn { background: #d4a85e !important; }
-    .ov-pill-tick.ws { background: #6ab0ff !important; }
+    .ov-pill-tick.ok   { background: #4ec9a5 !important; }
+    .ov-pill-tick.err  { background: #e5615e !important; }
+    .ov-pill-tick.warn { background: #d9a441 !important; }
+    .ov-pill-tick.ws   { background: #8fb0ff !important; }
     .ov-pill-expand {
       all: unset !important;
       cursor: pointer !important;
-      font-size: calc(11px * var(--ov-font-scale,1)) !important;
-      color: #6a7180 !important;
-      padding: 0 3px !important;
+      font-size: calc(12px * var(--ov-font-scale,1)) !important;
+      color: #39434f !important;
+      padding: 0 2px !important;
       line-height: 1 !important;
     }
-    .ov-pill-expand:hover { color: #6ab0ff !important; }
+    .ov-pill-expand:hover { color: #5b8cff !important; }
 
-    /* ── Ghost mode ── */
+    /* ══ Ghost mode ═════════════════════════════════════════════════════════ */
     .ov-ghost { opacity: 0.25 !important; transition: opacity 100ms !important; pointer-events: auto !important; }
     .ov-ghost:hover { opacity: 1 !important; }
 
-    /* ── Host page highlights ── */
+    /* ══ On the page itself ═════════════════════════════════════════════════ */
     .ov-highlighted {
-      outline: 2px solid #6ab0ff !important;
+      outline: 2px solid #4c9dff !important;
       outline-offset: 2px !important;
-      box-shadow: 0 0 0 4px rgba(106,176,255,.15) !important;
+      box-shadow: 0 0 0 4px rgba(76,157,255,.28) !important;
     }
+    /* Value tracing is purple throughout — hover preview, pinned matches, and
+       the one match the cycler is currently parked on. */
     .ov-value-hover {
-      outline: 1.5px dashed rgba(255,107,138,.55) !important;
-      outline-offset: 2px !important;
+      background: rgba(138,91,255,.10) !important;
+      box-shadow: 0 0 0 1px rgba(138,91,255,.35) !important;
+      border-radius: 4px !important;
     }
     .ov-value-match {
-      outline: 1.5px dashed #ff6b8a !important;
-      outline-offset: 2px !important;
+      background: rgba(138,91,255,.18) !important;
+      box-shadow: 0 0 0 2px rgba(138,91,255,.45) !important;
+      border-radius: 4px !important;
     }
     .ov-value-current {
-      outline: 2px solid #ff5a6e !important;
-      outline-offset: 3px !important;
-      box-shadow: 0 0 0 5px rgba(255,90,110,.18) !important;
+      background: rgba(138,91,255,.26) !important;
+      box-shadow: 0 0 0 2px rgba(138,91,255,.9), 0 0 0 6px rgba(138,91,255,.18) !important;
+      border-radius: 4px !important;
     }
 
-    /* ── Float badge cluster button ── */
+    /* ── Value-trace cycler ── */
+    .ov-value-cycler {
+      position: absolute !important;
+      z-index: 2147483646 !important;
+      transform: translateY(-100%) !important;
+      display: flex !important;
+      align-items: center !important;
+      gap: 9px !important;
+      padding: 6px 9px !important;
+      background: #141a21 !important;
+      border: 1px solid #8a5bff !important;
+      border-radius: 8px !important;
+      box-shadow: 0 12px 28px -8px rgba(0,0,0,.6) !important;
+      white-space: nowrap !important;
+      font-family: var(--ov-font-family,'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace) !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      color: #c3cdd8 !important;
+      animation: ov-fadein .12s ease !important;
+    }
+    .ov-value-cycler.ov-vc-below { transform: none !important; }
+    .ov-value-cycler[data-empty="1"] { border-color: #4f5a67 !important; }
+    .ov-vc-val { color: #e6c07b !important; }
+    .ov-value-cycler[data-empty="1"] .ov-vc-val { color: #8a97a6 !important; }
+    .ov-vc-lbl { color: #8a97a6 !important; font-size: calc(10px * var(--ov-font-scale,1)) !important; }
+    .ov-vc-nav { display: inline-flex !important; align-items: center !important; gap: 6px !important; }
+    .ov-vc-pos { color: #c3cdd8 !important; font-variant-numeric: tabular-nums !important; }
+    .ov-vc-btn {
+      all: unset !important;
+      cursor: pointer !important;
+      color: #8fb0ff !important;
+      font-family: inherit !important;
+      font-size: calc(13px * var(--ov-font-scale,1)) !important;
+      line-height: 1 !important;
+      padding: 0 3px !important;
+    }
+    .ov-vc-btn:hover { color: #ffffff !important; }
+
+    /* ── Element markers ── */
     .ov-float-badge {
       position: absolute !important;
       z-index: 2147483645 !important;
       pointer-events: none !important;
-      font-family: var(--ov-font-family,'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace) !important;
+      font-family: var(--ov-font-family,'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace) !important;
     }
-    .ov-fb-cluster {
-      pointer-events: auto !important;
-    }
+    .ov-fb-cluster { pointer-events: auto !important; }
 
     /* dark theme (default) */
     .ov-fb-cluster .ov-fb-circle {
-      background: #14161a !important;
-      color: #6ab0ff !important;
-      border-color: #2a2f37 !important;
+      background: #4c9dff !important;
+      color: #04121f !important;
+      border-color: rgba(255,255,255,.25) !important;
     }
     .ov-fb-cluster:hover .ov-fb-circle,
     .ov-fb-cluster.ov-fb-open .ov-fb-circle {
-      background: #1a1d22 !important;
-      color: #6ab0ff !important;
-      border-color: #6ab0ff !important;
+      background: #6fb2ff !important;
+      border-color: #ffffff !important;
     }
-    .ov-fb-cluster .ov-fb-popup {
-      background: #14161a !important;
-      border-color: #2a2f37 !important;
-    }
-    .ov-fb-cluster .ov-fb-url { color: #9aa1ab !important; }
-    .ov-fb-cluster .ov-fb-s   { color: #6c727c !important; }
+    .ov-fb-cluster .ov-fb-popup { background: #141a21 !important; border-color: #2a333f !important; }
+    .ov-fb-cluster .ov-fb-url { color: #c3cdd8 !important; }
+    .ov-fb-cluster .ov-fb-s   { color: #8a97a6 !important; }
 
     /* light theme */
     .ov-fb-cluster[data-theme="light"] .ov-fb-circle {
-      background: #ffffff !important;
-      color: #2a6fdb !important;
-      border-color: #d9d4c4 !important;
-      box-shadow: 0 2px 8px rgba(0,0,0,.18) !important;
+      background: #2563eb !important;
+      color: #ffffff !important;
+      border-color: rgba(255,255,255,.6) !important;
     }
     .ov-fb-cluster[data-theme="light"]:hover .ov-fb-circle,
-    .ov-fb-cluster[data-theme="light"].ov-fb-open .ov-fb-circle {
-      background: #f3f1ec !important;
-      border-color: #2a6fdb !important;
-    }
+    .ov-fb-cluster[data-theme="light"].ov-fb-open .ov-fb-circle { background: #1d4ed8 !important; }
     .ov-fb-cluster[data-theme="light"] .ov-fb-popup {
       background: #ffffff !important;
-      border-color: #d9d4c4 !important;
-      box-shadow: 0 6px 20px rgba(0,0,0,.15) !important;
+      border-color: #dce1e8 !important;
+      box-shadow: 0 14px 32px -10px rgba(20,30,50,.28) !important;
     }
-    .ov-fb-cluster[data-theme="light"] .ov-fb-url { color: #4a4f59 !important; }
-    .ov-fb-cluster[data-theme="light"] .ov-fb-s   { color: #6c727c !important; }
+    .ov-fb-cluster[data-theme="light"] .ov-fb-url { color: #3a4552 !important; }
+    .ov-fb-cluster[data-theme="light"] .ov-fb-s   { color: #5c6773 !important; }
 
-    /* Single-endpoint inline badge */
+    /* Single-endpoint inline marker — the design's method pill on the element */
     .ov-fb-single {
       pointer-events: auto !important;
-      background: #14161a !important;
-      border: 1px solid #2a2f37 !important;
-      border-radius: 4px !important;
-      box-shadow: 0 2px 8px rgba(0,0,0,.45) !important;
+      background: #4c9dff !important;
+      border: 0 !important;
+      border-radius: 7px !important;
+      box-shadow: 0 6px 14px -4px rgba(0,0,0,.5) !important;
       animation: ov-fadein .15s ease !important;
       max-width: min(340px, 90vw) !important;
+      overflow: hidden !important;
     }
-    .ov-fb-single .ov-fb-row { border-bottom: none !important; }
-    .ov-fb-single .ov-fb-url { color: #9aa1ab !important; }
-    .ov-fb-single .ov-fb-s   { color: #6c727c !important; }
-    .ov-fb-single[data-theme="light"] {
-      background: #ffffff !important;
-      border-color: #d9d4c4 !important;
-      box-shadow: 0 2px 8px rgba(0,0,0,.18) !important;
-    }
-    .ov-fb-single[data-theme="light"] .ov-fb-url { color: #4a4f59 !important; }
-    .ov-fb-single[data-theme="light"] .ov-fb-s   { color: #6c727c !important; }
+    .ov-fb-single .ov-fb-row { border-bottom: none !important; padding: 2px 8px !important; }
+    .ov-fb-single .ov-fb-m { background: transparent !important; color: #04121f !important; padding: 0 !important; }
+    .ov-fb-single .ov-fb-url { color: #04121f !important; font-weight: 600 !important; }
+    .ov-fb-single .ov-fb-s   { color: rgba(4,18,31,.7) !important; }
+    .ov-fb-single[data-theme="light"] { background: #2563eb !important; }
+    .ov-fb-single[data-theme="light"] .ov-fb-m,
+    .ov-fb-single[data-theme="light"] .ov-fb-url { color: #ffffff !important; }
+    .ov-fb-single[data-theme="light"] .ov-fb-s { color: rgba(255,255,255,.75) !important; }
 
     .ov-fb-circle {
       display: flex !important;
       align-items: center !important;
       justify-content: center !important;
-      width: 26px !important;
-      height: 26px !important;
-      border-radius: 50% !important;
+      width: 24px !important;
+      height: 24px !important;
+      border-radius: 8px !important;
       font-size: calc(11px * var(--ov-font-scale,1)) !important;
       font-weight: 700 !important;
       cursor: pointer !important;
-      box-shadow: 0 2px 8px rgba(0,0,0,.45) !important;
+      box-shadow: 0 6px 14px -4px rgba(0,0,0,.5) !important;
       border: 1.5px solid !important;
       user-select: none !important;
       animation: ov-fadein .15s ease !important;
       transition: background .12s, border-color .12s, transform .1s !important;
     }
-    .ov-fb-cluster:hover .ov-fb-circle {
-      transform: scale(1.1) !important;
-    }
+    .ov-fb-cluster:hover .ov-fb-circle { transform: scale(1.1) !important; }
 
-    /* popup panel — opens to the right of the circle */
     .ov-fb-popup {
       display: none !important;
       position: absolute !important;
       top: -4px !important;
       min-width: 230px !important;
       max-width: 340px !important;
-      border-radius: 6px !important;
-      box-shadow: 0 6px 20px rgba(0,0,0,.5) !important;
+      border-radius: var(--ov-r-lg, 10px) !important;
+      box-shadow: 0 20px 40px -12px rgba(0,0,0,.6) !important;
       padding: 4px 0 !important;
       animation: ov-fadein .12s ease !important;
       z-index: 2147483646 !important;
       border: 1px solid !important;
+      overflow: hidden !important;
     }
-    /* default: open to the right of the circle */
-    .ov-fb-popup-right { left: 32px !important; right: auto !important; }
-    /* flip: open to the left when circle is in the right half of the viewport */
-    .ov-fb-popup-left  { right: 32px !important; left: auto !important; }
-    .ov-fb-popup-show {
-      display: block !important;
-    }
+    .ov-fb-popup-right { left: 30px !important; right: auto !important; }
+    .ov-fb-popup-left  { right: 30px !important; left: auto !important; }
+    .ov-fb-popup-show { display: block !important; }
     .ov-fb-row {
       display: flex !important;
       align-items: center !important;
-      gap: 5px !important;
+      gap: 6px !important;
       padding: 5px 10px !important;
       white-space: nowrap !important;
       overflow: hidden !important;
-      border-bottom: 1px solid #1e2229 !important;
+      border-bottom: 1px solid rgba(255,255,255,.05) !important;
       cursor: pointer !important;
     }
-    .ov-fb-cluster[data-theme="light"] .ov-fb-row {
-      border-bottom-color: #ebe6d8 !important;
-    }
+    .ov-fb-cluster[data-theme="light"] .ov-fb-row { border-bottom-color: #eef1f5 !important; }
     .ov-fb-row:last-child { border-bottom: none !important; }
+    .ov-fb-cluster .ov-fb-row:hover { background: rgba(91,140,255,.12) !important; }
     .ov-fb-m {
       font-weight: 700 !important;
       font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      letter-spacing: .04em !important;
-      padding: 1px 5px !important;
-      border-radius: 2px !important;
-      color: #fff !important;
+      letter-spacing: .03em !important;
+      padding: 1px 6px !important;
+      border-radius: 4px !important;
+      color: #04121f !important;
       flex-shrink: 0 !important;
     }
-    .ov-fb-m-get    { background: #1f6feb !important; }
-    .ov-fb-m-post   { background: #7a3df0 !important; }
-    .ov-fb-m-put    { background: #b8631a !important; }
-    .ov-fb-m-patch  { background: #a6791f !important; }
-    .ov-fb-m-delete { background: #d23158 !important; }
-    .ov-fb-m-ws     { background: #1a8473 !important; }
+    .ov-fb-m-get    { background: #7bb0a0 !important; }
+    .ov-fb-m-post   { background: #4c9dff !important; }
+    .ov-fb-m-put    { background: #d9a441 !important; }
+    .ov-fb-m-patch  { background: #d9a441 !important; }
+    .ov-fb-m-delete { background: #e5615e !important; }
+    .ov-fb-m-ws     { background: #b78bff !important; }
     .ov-fb-url {
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
       overflow: hidden !important;
@@ -3485,19 +4361,15 @@ function injectStyles(): void {
       min-width: 0 !important;
     }
     .ov-fb-s {
-      font-weight: 700 !important;
+      font-weight: 600 !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
       flex-shrink: 0 !important;
     }
-    .ov-fb-s-2 { color: #4ec9b0 !important; }
-    .ov-fb-s-4 { color: #d4a85e !important; }
-    .ov-fb-s-5 { color: #ff5a6e !important; }
-    @keyframes ov-fadein {
-      from { opacity:0; transform:translateY(4px); }
-      to   { opacity:1; transform:translateY(0); }
-    }
+    .ov-fb-s-2 { color: #4ec9a5 !important; }
+    .ov-fb-s-4 { color: #d9a441 !important; }
+    .ov-fb-s-5 { color: #e5615e !important; }
 
-    /* ── Tooltips ── */
+    /* ══ Tooltips ═══════════════════════════════════════════════════════════ */
     #ov-panel [data-tip] { position: relative !important; }
     #ov-panel [data-tip]::after {
       content: attr(data-tip) !important;
@@ -3508,16 +4380,17 @@ function injectStyles(): void {
       background: var(--ov-bg-3) !important;
       color: var(--ov-text-dim) !important;
       border: 1px solid var(--ov-border) !important;
-      border-radius: 2px !important;
+      border-radius: var(--ov-r-sm) !important;
       padding: 4px 8px !important;
       font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      font-family: var(--ov-font-family,'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace) !important;
+      font-family: var(--ov-font-family,'IBM Plex Mono',ui-monospace,monospace) !important;
       line-height: 1.5 !important;
       white-space: nowrap !important;
       pointer-events: none !important;
       opacity: 0 !important;
       transition: opacity 0.1s !important;
       z-index: 9999 !important;
+      box-shadow: var(--ov-shadow-pop) !important;
     }
     #ov-panel [data-tip]::before {
       content: '' !important;
@@ -3534,9 +4407,7 @@ function injectStyles(): void {
     }
     #ov-panel [data-tip]:hover::after { opacity: 1 !important; transition: opacity 0.15s 0.4s !important; }
     #ov-panel [data-tip]:hover::before { opacity: 1 !important; transition: opacity 0.15s 0.4s !important; }
-    #ov-panel [data-tip][data-tip-pos="above"]::after {
-      top: auto !important; bottom: calc(100% + 7px) !important;
-    }
+    #ov-panel [data-tip][data-tip-pos="above"]::after { top: auto !important; bottom: calc(100% + 7px) !important; }
     #ov-panel [data-tip][data-tip-pos="above"]::before {
       top: auto !important; bottom: calc(100% + 2px) !important;
       border-bottom-color: transparent !important;
@@ -3544,6 +4415,7 @@ function injectStyles(): void {
     }
     #ov-panel [data-tip][data-tip-align="right"]::after { left: auto !important; right: 0 !important; transform: none !important; }
     #ov-panel [data-tip][data-tip-align="right"]::before { left: auto !important; right: 8px !important; transform: none !important; }
+${smStylesCss()}
   `;
   document.documentElement.appendChild(s);
 }
@@ -3582,6 +4454,9 @@ function restoreFilters(saved: unknown): void {
 }
 
 function buildOverlaySurface(): void {
+  // Opened by the site-map scanner: capture into the map, render nothing. The
+  // scanned tab is closed as soon as its calls have been harvested.
+  if (smCaptureOnly) { drainPreActivationBuffer(); return; }
   if (dockState === 'pill') buildPill();
   else buildPanel();
   // Replay anything captured before the UI existed (load-time requests).
@@ -3590,19 +4465,22 @@ function buildOverlaySurface(): void {
 
 function applyStoredOverlayState(result: Record<string, unknown>): void {
   dockState = (result.ovDockState as DockState) || 'panel';
+  const view = result.ovView;
+  if (view === 'log' || view === 'pinned' || view === 'map') currentView = view;
   if (Array.isArray(result.ovPinnedKeys)) {
     for (const k of result.ovPinnedKeys) pinnedKeys.add(k);
   }
   restoreFilters(result.ovFilters);
   savedPanelGeom = isValidPanelGeom(result.ovPanelGeom) ? result.ovPanelGeom : null;
   savedPillGeom = isValidPillGeom(result.ovPillGeom) ? result.ovPillGeom : null;
-  hydrateFromPreserved(buildOverlaySurface);
+  // Must resolve before the surface is built — it decides whether to build one.
+  void smCheckScanTab().then(() => hydrateFromPreserved(buildOverlaySurface));
 }
 
 function applyLoadedTheme(theme: 'dark' | 'light'): void {
   currentTheme = theme;
   chrome.storage.local.get(
-    ['ovDockState', 'ovPinnedKeys', 'ovFilters', 'ovPanelGeom', 'ovPillGeom'],
+    ['ovDockState', 'ovView', 'ovPinnedKeys', 'ovFilters', 'ovPanelGeom', 'ovPillGeom'],
     applyStoredOverlayState,
   );
 }
@@ -3644,7 +4522,8 @@ function activateOverlay(): void {
 function deactivateOverlay(): void {
   if (!activated) return;
   activated = false;
-  rowEventsBound = false;
+  // rowEventsBound needs no reset: it is keyed on the containers themselves, and
+  // deactivation removes the panel, so a rebuild always gets fresh elements.
   if (clusterOutsideClickHandler) {
     document.removeEventListener('click', clusterOutsideClickHandler, true);
     clusterOutsideClickHandler = null;
@@ -3664,6 +4543,7 @@ function deactivateOverlay(): void {
   requestsRev = 0;
   clearRevHighlight();
   signalInjected('stop');
+  smTeardown();
   cancelScheduledRender();
   // NOTE: do NOT clearPreserved() here — deactivation can fire from a transient
   // allowlist toggle (or extension reload), and dropping the user's captured
@@ -3694,7 +4574,9 @@ function deactivateOverlay(): void {
   panelVisible = true;
   preActivationBuffer.length = 0;
   dockState = 'panel';
-  showPinTray = false;
+  currentView = 'log';
+  filtersOpen = false;
+  settingsOpen = false;
   ghostHeld = false;
 }
 
