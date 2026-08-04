@@ -799,6 +799,7 @@ function smEndpointRowHtml(ep: SmEndpoint, route: string): string {
     <span class="ov-sm-m m-${safeMethodClass(method === '?' ? 'GET' : method)}${method === '?' ? ' ov-sm-m-unk' : ''}">${escHtml(method)}</span>
     <span class="ov-sm-url">${escHtml(ep.template)}</span>
     ${ep.interactive ? '<span class="ov-sm-zap" title="triggered by a user interaction">⚡</span>' : ''}
+    <i class="ov-sm-sw ov-sm-sw-${ep.tier}" title="${ep.tier}"></i>
     ${count}${statusHtml}<span class="ov-sm-ms">${escHtml(ms)}</span>
   </div>`;
 }
@@ -935,9 +936,9 @@ function smSiteMapHtml(): string {
 
   const tiers = smTierCounts();
   const legend = `<div class="ov-sm-legend">
-    <span class="ov-sm-tier ov-tier-observed"><i class="ov-sm-sw"></i>observed <b>${tiers.observed}</b></span>
-    <span class="ov-sm-tier ov-tier-declared"><i class="ov-sm-sw"></i>declared <b>${tiers.declared}</b></span>
-    <span class="ov-sm-tier ov-tier-inferred"><i class="ov-sm-sw"></i>inferred <b>${tiers.inferred}</b></span>
+    <span class="ov-sm-tier ov-tier-observed"><i class="ov-sm-sw ov-sm-sw-observed"></i>observed <b>${tiers.observed}</b></span>
+    <span class="ov-sm-tier ov-tier-declared"><i class="ov-sm-sw ov-sm-sw-declared"></i>declared <b>${tiers.declared}</b></span>
+    <span class="ov-sm-tier ov-tier-inferred"><i class="ov-sm-sw ov-sm-sw-inferred"></i>inferred <b>${tiers.inferred}</b></span>
     <span class="ov-sm-spacer"></span>
     <span class="ov-sm-legend-note">inferred rows are candidates — click scan to verify</span>
   </div>`;
@@ -1231,17 +1232,20 @@ function smStylesCss(): string {
     }
     #ov-panel .ov-sm-tier { display: inline-flex !important; align-items: center !important; gap: 6px !important; }
     #ov-panel .ov-sm-tier b { font-weight: 700 !important; }
+    /* One swatch definition, shared by the legend and the endpoint rows, so the
+       key and the thing it explains are literally the same mark. */
     #ov-panel .ov-sm-sw {
       width: 8px !important; height: 8px !important; border-radius: 2px !important;
       display: inline-block !important; flex-shrink: 0 !important;
+      box-sizing: border-box !important;
     }
-    #ov-panel .ov-sm-legend .ov-tier-observed { color: var(--ov-s-2xx) !important; }
-    #ov-panel .ov-sm-legend .ov-tier-observed .ov-sm-sw { background: var(--ov-s-2xx) !important; }
-    #ov-panel .ov-sm-legend .ov-tier-declared { color: var(--ov-s-3xx) !important; }
-    #ov-panel .ov-sm-legend .ov-tier-declared .ov-sm-sw { background: var(--ov-s-3xx) !important; }
+    #ov-panel .ov-sm-sw-observed { background: var(--ov-s-2xx) !important; }
+    #ov-panel .ov-sm-sw-declared { background: var(--ov-s-3xx) !important; }
     /* Inferred is dashed everywhere it appears — the shape says "candidate". */
+    #ov-panel .ov-sm-sw-inferred { background: transparent !important; border: 1px dashed var(--ov-s-4xx) !important; }
+    #ov-panel .ov-sm-legend .ov-tier-observed { color: var(--ov-s-2xx) !important; }
+    #ov-panel .ov-sm-legend .ov-tier-declared { color: var(--ov-s-3xx) !important; }
     #ov-panel .ov-sm-legend .ov-tier-inferred { color: var(--ov-s-4xx) !important; }
-    #ov-panel .ov-sm-legend .ov-tier-inferred .ov-sm-sw { background: transparent !important; border: 1px dashed var(--ov-s-4xx) !important; }
     #ov-panel .ov-sm-legend-note { color: var(--ov-text-ghost) !important; }
 
     /* ── Page cards ── */
@@ -1325,15 +1329,10 @@ function smStylesCss(): string {
     #ov-panel .ov-sm-st { flex-shrink: 0 !important; font-size: calc(9px * var(--ov-font-scale,1)) !important; font-weight: 600 !important; }
     #ov-panel .ov-sm-ms { flex-shrink: 0 !important; color: var(--ov-text-ghost) !important; font-size: calc(9px * var(--ov-font-scale,1)) !important; min-width: 34px !important; text-align: right !important; }
 
-    /* The tier rail: solid for facts, dashed for guesses. Inferred rows are also
-       dimmed and italic so they never read as measured data. */
-    #ov-panel .ov-sm-ep.ov-tier-observed { box-shadow: inset 2px 0 0 var(--ov-s-2xx) !important; }
-    #ov-panel .ov-sm-ep.ov-tier-declared { box-shadow: inset 2px 0 0 var(--ov-s-3xx) !important; }
-    #ov-panel .ov-sm-ep.ov-tier-inferred {
-      opacity: .72 !important;
-      border-left: 2px dashed var(--ov-s-4xx) !important;
-      padding-left: 20px !important;
-    }
+    /* Tier is carried by the same swatch the legend uses, sitting with the other
+       trailing metadata. A left rail here reads as a stray bracket, because the
+       row is rounded and the mark is only as tall as one line of text. */
+    #ov-panel .ov-sm-ep.ov-tier-inferred { opacity: .72 !important; }
     #ov-panel .ov-sm-ep.ov-tier-inferred .ov-sm-url { font-style: italic !important; }
 
     /* ── Third-party group ── */
