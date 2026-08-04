@@ -23,9 +23,17 @@ interface ApiRequest {
   resHeaders?: HeaderPair[] | null;
   messages?: WsMessage[];
   ms?: number;
+  // The page (or SPA route) that was loaded when this call fired. Stamped by the
+  // content script rather than the injected hook, so it tracks in-page route
+  // changes for free — location.href is read once per captured request.
+  pageUrl?: string;
   _lcUrl?: string;
   _lcReqBody?: string;
   _lcResBody?: string;
+  // Set once the site map has counted this request; the capture path emits
+  // several times per request (pending → status → body) and only the first
+  // terminal emit should increment a call count.
+  _smFolded?: boolean;
 }
 
 interface OverlayMessage extends Partial<ApiRequest> {
@@ -198,6 +206,7 @@ function trimForPreserve(r: ApiRequest): ApiRequest {
   delete copy._lcUrl;
   delete copy._lcReqBody;
   delete copy._lcResBody;
+  delete copy._smFolded;
   if (copy.resBody != null && copy.resBody.length > MAX_PRESERVED_BODY_BYTES) {
     copy.resBody = `${copy.resBody.slice(0, MAX_PRESERVED_BODY_BYTES)}…[trimmed for storage]`;
   }
@@ -273,6 +282,10 @@ function hydrateFromPreserved(onDone: () => void): void {
           refreshSearchCache(copy, copy as OverlayMessage);
           if (pinnedKeys.has(pinKey(copy))) pinnedIds.add(localId);
           requests.set(localId, copy);
+          // Restored rows carry their original pageUrl, so they rebuild the map
+          // for pages visited earlier in this tab's history.
+          copy._smFolded = false;
+          smFoldRequest(copy);
         }
         requestsRev++;   // restored rows add new triggering-element mappings
         trimRequests();
@@ -413,9 +426,23 @@ function handleOverlayMessage(msg: OverlayMessage): void {
   if (existing) {
     updateExistingRequest(existing, msg);
   } else {
+    if (paused) return;
+    const fresh = { ...msg, pageUrl: location.href } as ApiRequest;
+    refreshSearchCache(fresh, msg);
+    requests.set(msg.id, fresh);
+    requestsRev++;   // new triggering-element → id mapping
+    // restore pin state from persisted keys
+    if (pinnedKeys.has(pinKey(fresh))) pinnedIds.add(fresh.id);
+    trimRequests();
+    markPreserveDirty(fresh.id);
     if (paused) return;   // pause gates new entries only
     insertNewRequest(msg);
   }
+
+  // Fold into the site map as calls land, not on demand: the aggregate has to
+  // outlive trimRequests(), which drops the oldest entries out of `requests`.
+  const folded = requests.get(msg.id);
+  if (folded) smFoldRequest(folded);
 
   scheduleRenderUnlessPaused();
 
@@ -475,6 +502,7 @@ chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, 
       clearJvHover();
       clearRevHighlight();
       clearPreserved();
+      smReset();
       renderList();
       sendResponse({ ok: true });
       break;
@@ -798,6 +826,10 @@ function byteSize(r: ApiRequest): number {
 
 // ── Status bucket ─────────────────────────────────────────────────────────────
 
+// Structurally typed rather than taking an ApiRequest: the site map buckets
+// statuses for endpoints reconstructed from a background scan, which never
+// become full ApiRequest records.
+function statusBucket(req: { status: RequestStatus; kind?: string }): string {
 // A websocket row is only "successful" as a completed handshake (101) or a
 // clean close; any other status on a ws row is a failure.
 function wsStatusBucket(s: RequestStatus): string {
@@ -1516,6 +1548,24 @@ const REGEX_MAX_INPUT = 8000;
 // the input when a regex fails to compile.
 interface TextMatcher { test: (r: ApiRequest) => boolean; invalid: boolean }
 
+  // The site map is built from its own accumulator and from static analysis, so
+  // it still has something to show when the capture hook was blocked outright.
+  if (smView === 'map') {
+    captureJvScrollState();
+    destroyAllJvVirt();
+    smRenderSiteMap();
+    renderFooter();
+    return;
+  }
+
+  if (cspBlocked) {
+    list.innerHTML = `<div class="ov-empty" style="color:var(--ov-s-err)">
+      Capture script failed to load.<br><small>Likely blocked by the page's Content-Security-Policy.</small>
+    </div>`;
+    if (countEl) countEl.textContent = '0';
+    renderFooter();
+    return;
+  }
 function regexMatchesRequest(r: ApiRequest, regex: RegExp): boolean {
   const clip = (str: string): string => str.length > REGEX_MAX_INPUT ? str.slice(0, REGEX_MAX_INPUT) : str;
   return regex.test(clip(r.url || ''))
@@ -1982,6 +2032,7 @@ function buildPanel(): void {
         <button id="ov-pause" data-tip="Pause or resume capturing">${paused ? '▶ rec' : '⏸ pause'}</button>
         <div class="ov-divider"></div>
         <button id="ov-theme" data-tip="Toggle dark / light theme">${currentTheme === 'dark' ? 'light' : 'dark'}</button>
+        <button id="ov-sitemap" data-tip="Build the site map — pages and the APIs each one uses">⊞ map</button>
         <button id="ov-export" data-tip="Export as HAR file">↓ har</button>
         <div class="ov-divider"></div>
         <button id="ov-clear" data-tip="Clear all requests">✕ clear</button>
@@ -2040,6 +2091,7 @@ function buildPanel(): void {
   const ovPause    = $('ov-pause');
   const ovTheme    = $('ov-theme');
   const ovExport   = $('ov-export');
+  const ovSitemap  = $('ov-sitemap');
   const caseBtn    = $('ov-case-toggle');
   const regexBtn   = $('ov-regex-toggle');
 
@@ -2049,7 +2101,12 @@ function buildPanel(): void {
     clearAllBadges(); clearValueHighlights(); clearBulkHighlights();
     clearJvHover(); clearRevHighlight();
     clearPreserved();
+    smReset();
     renderList();
+  };
+  if (ovSitemap) ovSitemap.onclick = () => {
+    if (smView === 'map') smSetView('log');
+    else smOpenSiteMap();
   };
   if (ovPause) ovPause.onclick = () => setPaused(!paused);
   if (ovTheme) ovTheme.onclick = () => {
@@ -2075,6 +2132,7 @@ function buildPanel(): void {
   makeResizable(panel);
   const list = $('ov-list')!;
   bindListDelegation(list);
+  smBindSiteMapDelegation(list);
   bindChipDelegation($('ov-chips')!);
   bindFooterDelegation($('ov-footer')!);
   renderList();
@@ -3544,6 +3602,7 @@ function injectStyles(): void {
     }
     #ov-panel [data-tip][data-tip-align="right"]::after { left: auto !important; right: 0 !important; transform: none !important; }
     #ov-panel [data-tip][data-tip-align="right"]::before { left: auto !important; right: 8px !important; transform: none !important; }
+${smStylesCss()}
   `;
   document.documentElement.appendChild(s);
 }
@@ -3617,6 +3676,31 @@ function activateOverlay(): void {
 
   const init = () => {
     loadFont().then(({ family, size }) => applyFont(family, size));
+    loadTheme().then(theme => {
+      currentTheme = theme;
+      chrome.storage.local.get(['ovDockState', 'ovPinnedKeys', 'ovFilters', 'ovPanelGeom', 'ovPillGeom'], result => {
+        dockState = (result.ovDockState as DockState) || 'panel';
+        if (Array.isArray(result.ovPinnedKeys)) {
+          for (const k of result.ovPinnedKeys) pinnedKeys.add(k);
+        }
+        if (result.ovFilters) {
+          const f = result.ovFilters as { status?: string[]; methods?: string[]; initiators?: string[] };
+          if (f.status) for (const s of f.status) activeStatus.add(s);
+          if (f.methods) for (const m of f.methods) activeMethods.add(m);
+          if (f.initiators) for (const i of f.initiators) activeInitiators.add(i);
+        }
+        savedPanelGeom = isValidPanelGeom(result.ovPanelGeom) ? result.ovPanelGeom : null;
+        savedPillGeom = isValidPillGeom(result.ovPillGeom) ? result.ovPillGeom : null;
+        void smCheckScanTab().then(() => {
+          hydrateFromPreserved(() => {
+            // Opened by the site-map scanner: capture only, render nothing.
+            if (smCaptureOnly) return;
+            if (dockState === 'pill') buildPill();
+            else buildPanel();
+          });
+        });
+      });
+    });
     loadTheme().then(applyLoadedTheme);
   };
 
@@ -3689,6 +3773,7 @@ function deactivateOverlay(): void {
   activeStatus.clear();
   activeMethods.clear();
   activeInitiators.clear();
+  smTeardown();
   activeFlags.clear();
   paused = false;
   panelVisible = true;
