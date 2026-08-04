@@ -23,9 +23,17 @@ interface ApiRequest {
   resHeaders?: HeaderPair[] | null;
   messages?: WsMessage[];
   ms?: number;
+  // The page (or SPA route) that was loaded when this call fired. Stamped by the
+  // content script rather than the injected hook, so it tracks in-page route
+  // changes for free — location.href is read once per captured request.
+  pageUrl?: string;
   _lcUrl?: string;
   _lcReqBody?: string;
   _lcResBody?: string;
+  // Set once the site map has counted this request; the capture path emits
+  // several times per request (pending → status → body) and only the first
+  // terminal emit should increment a call count.
+  _smFolded?: boolean;
 }
 
 interface OverlayMessage extends Partial<ApiRequest> {
@@ -185,6 +193,7 @@ function trimForPreserve(r: ApiRequest): ApiRequest {
   delete copy._lcUrl;
   delete copy._lcReqBody;
   delete copy._lcResBody;
+  delete copy._smFolded;
   if (copy.resBody != null && copy.resBody.length > MAX_PRESERVED_BODY_BYTES) {
     copy.resBody = `${copy.resBody.slice(0, MAX_PRESERVED_BODY_BYTES)}…[trimmed for storage]`;
   }
@@ -260,6 +269,10 @@ function hydrateFromPreserved(onDone: () => void): void {
           refreshSearchCache(copy, copy as OverlayMessage);
           if (pinnedKeys.has(pinKey(copy))) pinnedIds.add(localId);
           requests.set(localId, copy);
+          // Restored rows carry their original pageUrl, so they rebuild the map
+          // for pages visited earlier in this tab's history.
+          copy._smFolded = false;
+          smFoldRequest(copy);
         }
         requestsRev++;   // restored rows add new triggering-element mappings
         trimRequests();
@@ -371,7 +384,7 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
     markPreserveDirty(existing.id);
   } else {
     if (paused) return;
-    const fresh = { ...msg } as ApiRequest;
+    const fresh = { ...msg, pageUrl: location.href } as ApiRequest;
     refreshSearchCache(fresh, msg);
     requests.set(msg.id, fresh);
     requestsRev++;   // new triggering-element → id mapping
@@ -380,6 +393,11 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
     trimRequests();
     markPreserveDirty(fresh.id);
   }
+
+  // Fold into the site map as calls land, not on demand: the aggregate has to
+  // outlive trimRequests(), which drops the oldest entries out of `requests`.
+  const folded = requests.get(msg.id);
+  if (folded) smFoldRequest(folded);
 
   scheduleRenderUnlessPaused();
 
@@ -428,6 +446,7 @@ chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, 
       clearJvHover();
       clearRevHighlight();
       clearPreserved();
+      smReset();
       renderList();
       sendResponse({ ok: true });
       break;
@@ -754,7 +773,10 @@ function byteSize(r: ApiRequest): number {
 
 // ── Status bucket ─────────────────────────────────────────────────────────────
 
-function statusBucket(req: ApiRequest): string {
+// Structurally typed rather than taking an ApiRequest: the site map buckets
+// statuses for endpoints reconstructed from a background scan, which never
+// become full ApiRequest records.
+function statusBucket(req: { status: RequestStatus; kind?: string }): string {
   const s = req.status;
   if (s === 'pending') return 'pending';
   if (s === 'error') return 'err';
@@ -1424,6 +1446,16 @@ function renderList(): void {
   const countEl = $('ov-count');
   if (!list) return;
 
+  // The site map is built from its own accumulator and from static analysis, so
+  // it still has something to show when the capture hook was blocked outright.
+  if (smView === 'map') {
+    captureJvScrollState();
+    destroyAllJvVirt();
+    smRenderSiteMap();
+    renderFooter();
+    return;
+  }
+
   if (cspBlocked) {
     list.innerHTML = `<div class="ov-empty" style="color:var(--ov-s-err)">
       Capture script failed to load.<br><small>Likely blocked by the page's Content-Security-Policy.</small>
@@ -1844,6 +1876,7 @@ function buildPanel(): void {
         <button id="ov-pause" data-tip="Pause or resume capturing">${paused ? '▶ rec' : '⏸ pause'}</button>
         <div class="ov-divider"></div>
         <button id="ov-theme" data-tip="Toggle dark / light theme">${currentTheme === 'dark' ? 'light' : 'dark'}</button>
+        <button id="ov-sitemap" data-tip="Build the site map — pages and the APIs each one uses">⊞ map</button>
         <button id="ov-export" data-tip="Export as HAR file">↓ har</button>
         <div class="ov-divider"></div>
         <button id="ov-clear" data-tip="Clear all requests">✕ clear</button>
@@ -1902,6 +1935,7 @@ function buildPanel(): void {
   const ovPause    = $('ov-pause');
   const ovTheme    = $('ov-theme');
   const ovExport   = $('ov-export');
+  const ovSitemap  = $('ov-sitemap');
   const caseBtn    = $('ov-case-toggle');
   const regexBtn   = $('ov-regex-toggle');
 
@@ -1911,7 +1945,12 @@ function buildPanel(): void {
     clearAllBadges(); clearValueHighlights(); clearBulkHighlights();
     clearJvHover(); clearRevHighlight();
     clearPreserved();
+    smReset();
     renderList();
+  };
+  if (ovSitemap) ovSitemap.onclick = () => {
+    if (smView === 'map') smSetView('log');
+    else smOpenSiteMap();
   };
   if (ovPause) ovPause.onclick = () => setPaused(!paused);
   if (ovTheme) ovTheme.onclick = () => {
@@ -1937,6 +1976,7 @@ function buildPanel(): void {
   makeResizable(panel);
   const list = $('ov-list')!;
   bindListDelegation(list);
+  smBindSiteMapDelegation(list);
   bindChipDelegation($('ov-chips')!);
   renderList();
 }
@@ -3384,6 +3424,7 @@ function injectStyles(): void {
     }
     #ov-panel [data-tip][data-tip-align="right"]::after { left: auto !important; right: 0 !important; transform: none !important; }
     #ov-panel [data-tip][data-tip-align="right"]::before { left: auto !important; right: 8px !important; transform: none !important; }
+${smStylesCss()}
   `;
   document.documentElement.appendChild(s);
 }
@@ -3423,9 +3464,13 @@ function activateOverlay(): void {
         }
         savedPanelGeom = isValidPanelGeom(result.ovPanelGeom) ? result.ovPanelGeom : null;
         savedPillGeom = isValidPillGeom(result.ovPillGeom) ? result.ovPillGeom : null;
-        hydrateFromPreserved(() => {
-          if (dockState === 'pill') buildPill();
-          else buildPanel();
+        void smCheckScanTab().then(() => {
+          hydrateFromPreserved(() => {
+            // Opened by the site-map scanner: capture only, render nothing.
+            if (smCaptureOnly) return;
+            if (dockState === 'pill') buildPill();
+            else buildPanel();
+          });
         });
       });
     });
@@ -3500,6 +3545,7 @@ function deactivateOverlay(): void {
   activeStatus.clear();
   activeMethods.clear();
   activeInitiators.clear();
+  smTeardown();
   paused = false;
   panelVisible = true;
   cspBlocked = false;
