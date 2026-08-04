@@ -153,15 +153,16 @@ let dockState: DockState = 'panel';
 const DEFAULT_PANEL_WIDTH = 520;
 const DEFAULT_PANEL_HEIGHT = 640;
 const DEFAULT_PILL_WIDTH = 120;
+// Bars in the ambient pill's activity band.
+const PILL_RAIL_TICKS = 22;
 type PanelGeom = { left: number; top: number; width: number; height: number };
 type PillGeom = { left: number; top: number };
 let savedPanelGeom: PanelGeom | null = null;
 let savedPillGeom: PillGeom | null = null;
 let currentView: OverlayView = 'log';
-// The status/method/initiator chips live in a popover rather than an always-on
-// row, so a narrow panel spends its width on the log instead of the filters.
-let filtersOpen = false;
-let settingsOpen = false;
+// The search field starts collapsed to its magnifying glass; every other control
+// is on the toolbar permanently.
+let searchOpen = false;
 let ghostHeld = false;
 let ghostTimer: number | null = null;
 let clusterOutsideClickHandler: ((e: MouseEvent) => void) | null = null;
@@ -1852,7 +1853,6 @@ function renderList(): void {
   }
   updateChipCounts(snapshot);
   updateSearchHits(visible.length);
-  refreshFiltersBadge();
 
   // Snapshot scroll positions of currently mounted JSON virtualizers, then tear
   // them down — the innerHTML writes below will detach their DOM hosts.
@@ -2224,20 +2224,18 @@ function pillInnerHtml(): string {
   const reqs = [...requests.values()];
   const total = reqs.length;
   const errs = reqs.filter(isError).length;
-  const recent = reqs.slice(-12);
-  // Bar height carries recency: the newest calls stand tallest, so the rail
-  // reads as a trend rather than a flat row of ticks.
-  const ticks = recent.map((r, i) => {
+  // A dense activity band of uniform bars, newest on the right. Errors keep their
+  // colour so a failing run is visible without expanding.
+  const recent = reqs.slice(-PILL_RAIL_TICKS);
+  const ticks = recent.map(r => {
     const cls = pillTickClass(r);
-    const h = 5 + Math.round((i / Math.max(1, recent.length - 1)) * 9);
-    return `<span class="ov-pill-tick${cls ? ' ' + cls : ''}" style="height:${h}px"></span>`;
+    return `<span class="ov-pill-tick${cls ? ' ' + cls : ''}"></span>`;
   }).join('');
   return `
-    <span class="ov-mark">C</span>
     <span class="ov-pill-dot${paused ? ' ov-pill-paused' : ''}"></span>
     <span class="ov-pill-count">${total}</span>
     <span class="ov-pill-label">req</span>
-    ${errs ? `<span class="ov-pill-err">${errs}⚠</span>` : ''}
+    ${errs ? `<span class="ov-pill-err">${errs}</span>` : ''}
     <span class="ov-pill-rail">${ticks}</span>
     <button class="ov-pill-expand" title="Expand panel">⤢</button>
   `;
@@ -2281,35 +2279,32 @@ function buildPanel(): void {
       <div class="ov-mark">C</div>
       <span class="ov-hdr-title">CalloutAPI</span>
       <span id="ov-live" class="ov-live"><span class="ov-live-dot"></span><span id="ov-count">0/0</span></span>
+      <div class="ov-hdr-spacer"></div>
+      <div id="ov-actions">
+        <button id="ov-pause" data-tip="Pause or resume capturing">${paused ? '▶' : '⏸'}</button>
+        <button id="ov-clear" data-tip="Clear all requests">🗑</button>
+        <button id="ov-theme" data-tip="Toggle dark / light theme">◐</button>
+        <button id="ov-export" data-tip="Export as HAR file">↓</button>
+        <button id="ov-collapse" data-tip="Minimize" data-tip-align="right">▁</button>
+      </div>
+    </div>
+    <div id="ov-toolbar">
       <div id="ov-views" class="ov-views">
         <button class="ov-view" data-v="log" data-tip="Captured requests">Log</button>
         <button class="ov-view" data-v="pinned" data-tip="Pinned requests">Pinned<span class="ov-view-n" id="ov-view-pin-n">0</span></button>
         <button class="ov-view" data-v="map" data-tip="Site map — pages to endpoints">Map</button>
       </div>
-      <div class="ov-search">
-        <span class="ov-prompt">⌕</span>
-        <input id="ov-filter" placeholder="search url · request · response" autocomplete="off" spellcheck="false"/>
+      <div class="ov-hdr-spacer"></div>
+      <div id="ov-search" class="ov-search">
+        <button id="ov-search-btn" class="ov-search-btn" data-tip="Search url, request and response" data-tip-align="right">⌕</button>
+        <input id="ov-filter" placeholder="url · request · response" autocomplete="off" spellcheck="false" tabindex="-1"/>
         <span id="ov-hits" class="ov-hits"></span>
-        <div class="ov-search-modes">
-          <button id="ov-case-toggle" class="ov-modebtn" data-tip="Case-sensitive search" data-tip-align="right">Aa</button>
-          <button id="ov-regex-toggle" class="ov-modebtn" data-tip="Regex search" data-tip-align="right">.*</button>
-        </div>
-      </div>
-      <button id="ov-filters-btn" class="ov-filters-btn" data-tip="Status, method and initiator filters">
-        <span class="ov-filters-ico">⛃</span><span class="ov-filters-lbl">Filters</span><span id="ov-filters-n" class="ov-filters-n" hidden>0</span><span class="ov-filters-caret">▾</span>
-      </button>
-      <div id="ov-actions">
-        <button id="ov-pause" data-tip="Pause or resume capturing">${paused ? '▶' : '⏸'}</button>
-        <button id="ov-settings-btn" data-tip="Theme, export and clear">⚙</button>
-        <button id="ov-collapse" data-tip="Minimize" data-tip-align="right">▁</button>
-      </div>
-      <div id="ov-settings" class="ov-menu" hidden>
-        <button class="ov-menu-item" id="ov-theme"><span class="ov-menu-ico">◐</span>Toggle theme</button>
-        <button class="ov-menu-item" id="ov-export"><span class="ov-menu-ico">↓</span>Export HAR</button>
-        <button class="ov-menu-item ov-menu-danger" id="ov-clear"><span class="ov-menu-ico">🗑</span>Clear log</button>
+        <button id="ov-case-toggle" class="ov-modebtn" data-tip="Case-sensitive" data-tip-align="right" tabindex="-1">Aa</button>
+        <button id="ov-regex-toggle" class="ov-modebtn" data-tip="Regular expression" data-tip-align="right" tabindex="-1">.*</button>
+        <button id="ov-search-clear" class="ov-search-clear" data-tip="Close search" data-tip-align="right" tabindex="-1">✕</button>
       </div>
     </div>
-    <div id="ov-chips" hidden>
+    <div id="ov-chips">
       <div class="ov-chip-group">
         <span class="ov-chip-label">status</span>
         <div class="ov-chip-set">
@@ -2395,9 +2390,10 @@ function buildPanel(): void {
   };
 
   bindViewTabs($('ov-views')!);
-  bindPopovers();
+  bindSearchToggle();
 
   makeDraggable(panel, $('ov-header')!);
+  makeDraggable(panel, $('ov-toolbar')!);
   makeResizable(panel);
   const list = $('ov-list')!;
   bindListDelegation(list);
@@ -2425,47 +2421,37 @@ function bindViewTabs(container: HTMLElement): void {
   });
 }
 
-function setFiltersOpen(open: boolean): void {
-  filtersOpen = open;
-  $('ov-chips')?.toggleAttribute('hidden', !open);
-  $('ov-filters-btn')?.classList.toggle('on', open);
-  if (open) setSettingsOpen(false);
+// The search box is a magnifying glass until it is needed, so the toolbar keeps
+// its width for the view tabs. Opening focuses the field; closing clears the
+// term, because a hidden filter silently shrinking the log is a trap.
+function setSearchOpen(open: boolean): void {
+  searchOpen = open;
+  const box = $('ov-search');
+  box?.classList.toggle('ov-search-open', open);
+  $('ov-search-btn')?.classList.toggle('ov-active', open);
+  // Keep the collapsed controls out of the tab order.
+  for (const el of box?.querySelectorAll<HTMLElement>('input, .ov-modebtn, .ov-search-clear') ?? []) {
+    el.tabIndex = open ? 0 : -1;
+  }
+  if (open) {
+    filterInput?.focus();
+    return;
+  }
+  if (filterInput?.value) {
+    filterInput.value = '';
+    renderList();
+  }
 }
 
-function setSettingsOpen(open: boolean): void {
-  settingsOpen = open;
-  $('ov-settings')?.toggleAttribute('hidden', !open);
-  $('ov-settings-btn')?.classList.toggle('ov-active', open);
-  if (open) setFiltersOpen(false);
-}
-
-// Both header popovers dismiss on the next click that lands outside them.
-function bindPopovers(): void {
-  const filters = $('ov-filters-btn');
-  if (filters) filters.onclick = () => setFiltersOpen(!filtersOpen);
-  const settings = $('ov-settings-btn');
-  if (settings) settings.onclick = () => setSettingsOpen(!settingsOpen);
-
-  $('ov-panel')?.addEventListener('click', (e: Event) => {
-    const t = e.target as Element;
-    if (filtersOpen && !t.closest('#ov-chips') && !t.closest('#ov-filters-btn')) setFiltersOpen(false);
-    if (settingsOpen && !t.closest('#ov-settings-btn')) setSettingsOpen(false);
+function bindSearchToggle(): void {
+  const btn = $('ov-search-btn');
+  if (btn) btn.onclick = () => setSearchOpen(!searchOpen);
+  const clear = $('ov-search-clear');
+  if (clear) clear.onclick = () => setSearchOpen(false);
+  // Escape closes the field from inside it, the usual way out of a search.
+  filterInput?.addEventListener('keydown', (e: KeyboardEvent) => {
+    if (e.key === 'Escape') { e.stopPropagation(); setSearchOpen(false); }
   });
-}
-
-// Number of chip filters currently constraining the log — the badge on the
-// Filters button, so an active filter is visible while the popover is shut.
-function activeFilterCount(): number {
-  return activeStatus.size + activeMethods.size + activeInitiators.size;
-}
-
-function refreshFiltersBadge(): void {
-  const n = activeFilterCount();
-  const badge = $('ov-filters-n');
-  if (!badge) return;
-  badge.textContent = String(n);
-  badge.toggleAttribute('hidden', n === 0);
-  $('ov-filters-btn')?.classList.toggle('ov-has-filters', n > 0);
 }
 
 // ── HAR export ────────────────────────────────────────────────────────────────
@@ -2920,7 +2906,9 @@ function makeGestureEnd(panel: HTMLElement, move: (ev: MouseEvent) => void): () 
 function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
   let ox = 0, oy = 0;
   handle.addEventListener('mousedown', (e: MouseEvent) => {
-    if ((e.target as HTMLElement).tagName === 'BUTTON') return;
+    // Form controls live in the header rows, and the preventDefault() below would
+    // stop them ever taking focus — you could not click into the search box.
+    if ((e.target as Element).closest('button, input, textarea, select, [contenteditable]')) return;
     e.preventDefault();
     const rect0 = panel.getBoundingClientRect();
     ox = e.clientX - rect0.left;
@@ -3216,28 +3204,68 @@ function injectStyles(): void {
     }
     .ov-view-n[hidden] { display: none !important; }
 
-    /* ── Search ── */
+    /* ── Second row: views + search ── */
+    #ov-toolbar {
+      display: flex !important;
+      align-items: center !important;
+      gap: 8px !important;
+      padding: 7px 10px !important;
+      background: var(--ov-bg-2) !important;
+      border-bottom: 1px solid var(--ov-border-soft) !important;
+      flex-shrink: 0 !important;
+      cursor: move !important;
+      user-select: none !important;
+    }
+
+    /* ── Search: a magnifying glass that opens into a field ── */
     .ov-search {
       display: flex !important;
       align-items: center !important;
-      gap: 7px !important;
-      flex: 1 1 90px !important;
-      min-width: 62px !important;
-      height: 30px !important;
-      background: var(--ov-bg-2) !important;
-      border: 1px solid var(--ov-border) !important;
+      gap: 6px !important;
+      height: 28px !important;
+      background: transparent !important;
+      border: 1px solid transparent !important;
       border-radius: 8px !important;
-      padding: 0 6px 0 9px !important;
+      padding: 0 !important;
+      flex: 0 0 auto !important;
+      transition: flex-basis 120ms ease, background 120ms, border-color 120ms !important;
     }
-    .ov-search:focus-within { border-color: var(--ov-accent-bd) !important; }
-    .ov-prompt {
+    .ov-search.ov-search-open {
+      flex: 1 1 auto !important;
+      min-width: 0 !important;
+      background: var(--ov-bg) !important;
+      border-color: var(--ov-border) !important;
+      padding: 0 5px 0 2px !important;
+    }
+    .ov-search.ov-search-open:focus-within { border-color: var(--ov-accent-bd) !important; }
+    .ov-search-btn {
+      all: unset !important;
+      cursor: pointer !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      width: 26px !important;
+      height: 26px !important;
+      flex: none !important;
+      border-radius: var(--ov-r) !important;
+      border: 1px solid var(--ov-border) !important;
+      background: var(--ov-bg-3) !important;
+      color: var(--ov-text-dim) !important;
+      font-size: calc(13px * var(--ov-font-scale,1)) !important;
+      font-family: inherit !important;
+      transition: color 90ms, border-color 90ms !important;
+    }
+    .ov-search-btn:hover { color: var(--ov-title) !important; border-color: var(--ov-text-faint) !important; }
+    .ov-search-open .ov-search-btn {
+      border-color: transparent !important;
+      background: transparent !important;
       color: var(--ov-text-faint) !important;
-      font-size: calc(12px * var(--ov-font-scale,1)) !important;
-      flex-shrink: 0 !important;
     }
+    /* Base appearance for everything inside the box. Every 'all: unset' has to
+       land before the collapse rules below — in a later rule it resets the very
+       properties the collapsed state sets, and the field never folds away. */
     #ov-filter {
       all: unset !important;
-      flex: 1 !important;
       min-width: 0 !important;
       color: var(--ov-text) !important;
       font-size: calc(11px * var(--ov-font-scale,1)) !important;
@@ -3245,17 +3273,19 @@ function injectStyles(): void {
     }
     #ov-filter::placeholder { color: var(--ov-text-ghost) !important; }
     #ov-filter.ov-filter-invalid { color: var(--ov-s-err) !important; }
-    .ov-hits {
-      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+    .ov-search-clear {
+      all: unset !important;
+      cursor: pointer !important;
+      flex: none !important;
       color: var(--ov-text-faint) !important;
-      white-space: nowrap !important;
-      flex-shrink: 0 !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      font-family: inherit !important;
+      border-radius: var(--ov-r-sm) !important;
     }
-    .ov-search-modes { display: flex !important; gap: 2px !important; flex-shrink: 0 !important; }
+    .ov-search-clear:hover { color: var(--ov-s-err) !important; }
     .ov-modebtn {
       all: unset !important;
       cursor: pointer !important;
-      padding: 2px 6px !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
       font-weight: 600 !important;
       font-family: inherit !important;
@@ -3268,42 +3298,23 @@ function injectStyles(): void {
       color: var(--ov-text-dim) !important;
       background: var(--ov-border) !important;
     }
-
-    /* ── Filters button ── */
-    .ov-filters-btn {
-      all: unset !important;
-      cursor: pointer !important;
-      display: inline-flex !important;
-      align-items: center !important;
-      gap: 6px !important;
-      padding: 5px 9px !important;
-      border-radius: 8px !important;
-      border: 1px solid var(--ov-border) !important;
-      background: var(--ov-bg-2) !important;
-      color: var(--ov-text-muted) !important;
-      font-family: var(--ov-font-family,'IBM Plex Sans',system-ui,sans-serif) !important;
-      font-size: calc(11px * var(--ov-font-scale,1)) !important;
-      font-weight: 600 !important;
+    .ov-hits {
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-text-faint) !important;
       white-space: nowrap !important;
       flex-shrink: 0 !important;
     }
-    .ov-filters-btn:hover { color: var(--ov-text-dim) !important; }
-    .ov-filters-btn.on,
-    .ov-filters-btn.ov-has-filters {
-      background: var(--ov-accent-bg) !important;
-      border-color: var(--ov-accent-bd) !important;
-      color: var(--ov-accent-soft) !important;
+
+    /* Collapsed: the field and its modifiers fold away, leaving only the glass. */
+    .ov-search:not(.ov-search-open) #ov-filter,
+    .ov-search:not(.ov-search-open) .ov-modebtn,
+    .ov-search:not(.ov-search-open) .ov-search-clear,
+    .ov-search:not(.ov-search-open) .ov-hits {
+      display: none !important;
     }
-    .ov-filters-n {
-      background: var(--ov-accent) !important;
-      color: var(--ov-mark-fg) !important;
-      border-radius: 10px !important;
-      padding: 0 5px !important;
-      font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      font-weight: 700 !important;
-    }
-    .ov-filters-n[hidden] { display: none !important; }
-    .ov-filters-caret { font-size: calc(9px * var(--ov-font-scale,1)) !important; }
+    .ov-search-open #ov-filter { flex: 1 1 auto !important; }
+    .ov-search-open .ov-modebtn,
+    .ov-search-open .ov-search-clear { padding: 2px 6px !important; }
 
     /* ── Icon actions ── */
     #ov-actions { display: flex !important; align-items: center !important; gap: 3px !important; flex-shrink: 0 !important; }
@@ -3333,76 +3344,39 @@ function injectStyles(): void {
       background: var(--ov-accent-bg) !important;
     }
 
-    /* ══ Settings menu ══════════════════════════════════════════════════════ */
-    .ov-menu {
-      position: absolute !important;
-      top: 42px !important;
-      right: 10px !important;
-      z-index: 6 !important;
-      min-width: 150px !important;
-      background: var(--ov-bg-3) !important;
-      border: 1px solid var(--ov-border) !important;
-      border-radius: var(--ov-r-lg) !important;
-      box-shadow: var(--ov-shadow-pop) !important;
-      padding: 4px !important;
-      display: flex !important;
-      flex-direction: column !important;
-      gap: 1px !important;
-      animation: ov-fadein .12s ease !important;
-    }
-    .ov-menu[hidden] { display: none !important; }
-    .ov-menu-item {
-      all: unset !important;
-      cursor: pointer !important;
+    /* ══ Filter row ═════════════════════════════════════════════════════════ */
+    /* Every filter is on the panel permanently — nothing behind a disclosure. */
+    #ov-chips {
       display: flex !important;
       align-items: center !important;
-      gap: 9px !important;
+      flex-wrap: wrap !important;
+      gap: 4px 10px !important;
       padding: 7px 10px !important;
-      border-radius: var(--ov-r) !important;
-      font-family: var(--ov-font-family,'IBM Plex Sans',system-ui,sans-serif) !important;
-      font-size: calc(11px * var(--ov-font-scale,1)) !important;
-      color: var(--ov-text-dim) !important;
-      white-space: nowrap !important;
+      background: var(--ov-bg) !important;
+      border-bottom: 1px solid var(--ov-border) !important;
+      flex-shrink: 0 !important;
     }
-    .ov-menu-item:hover { background: var(--ov-bg-2) !important; color: var(--ov-title) !important; }
-    .ov-menu-danger { color: var(--ov-s-err) !important; }
-    .ov-menu-danger:hover { background: rgba(229,97,94,.1) !important; color: var(--ov-s-err) !important; }
-    .ov-menu-ico { width: 14px !important; text-align: center !important; flex-shrink: 0 !important; }
-
-    /* ══ Filters popover ════════════════════════════════════════════════════ */
-    #ov-chips {
-      position: absolute !important;
-      top: 46px !important;
-      right: 10px !important;
-      z-index: 5 !important;
-      width: 262px !important;
-      max-width: calc(100% - 20px) !important;
-      background: var(--ov-bg-3) !important;
-      border: 1px solid var(--ov-border) !important;
-      border-radius: var(--ov-r-lg) !important;
-      box-shadow: var(--ov-shadow-pop) !important;
-      padding: 11px 12px !important;
+    .ov-chip-group {
       display: flex !important;
-      flex-direction: column !important;
-      gap: 11px !important;
-      animation: ov-fadein .12s ease !important;
+      align-items: center !important;
+      gap: 5px !important;
+      min-width: 0 !important;
     }
-    #ov-chips[hidden] { display: none !important; }
-    .ov-chip-group { display: flex !important; flex-direction: column !important; gap: 6px !important; }
     .ov-chip-label {
       font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      letter-spacing: .08em !important;
+      letter-spacing: .06em !important;
       text-transform: uppercase !important;
-      color: var(--ov-text-faint) !important;
+      color: var(--ov-text-ghost) !important;
+      flex-shrink: 0 !important;
     }
-    .ov-chip-set { display: flex !important; gap: 5px !important; flex-wrap: wrap !important; }
+    .ov-chip-set { display: flex !important; gap: 3px !important; flex-wrap: wrap !important; }
     .ov-chip {
       all: unset !important;
       cursor: pointer !important;
-      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      font-size: calc(9.5px * var(--ov-font-scale,1)) !important;
       font-weight: 600 !important;
       font-family: inherit !important;
-      padding: 3px 9px !important;
+      padding: 2px 7px !important;
       border-radius: var(--ov-r) !important;
       border: 1px solid var(--ov-border) !important;
       color: var(--ov-text-muted) !important;
@@ -3566,30 +3540,22 @@ function injectStyles(): void {
     /* Narrow panel: the initiator column is the first to go, then the duration.
        A hidden cell stops being a grid item, so each breakpoint drops the matching
        track too — leave the counts out of step and every later column shifts. */
-    @container (max-width: 640px) {
-      .ov-hdr-title { display: none !important; }
+    /* The chips name their own dimension ("2xx", "GET"), so the group labels are
+       the first thing to give up width when the row would otherwise wrap again. */
+    @container (max-width: 600px) {
+      .ov-chip-label { display: none !important; }
+      #ov-chips { gap: 4px 12px !important; }
     }
-    /* Below this the toolbar can no longer hold every label at full size, so the
-       secondary text goes and the controls tighten — nothing is dropped. */
-    @container (max-width: 570px) {
-      #ov-header { gap: 6px !important; padding: 8px !important; }
+    @container (max-width: 440px) {
+      .ov-hdr-title { display: none !important; }
+      #ov-header, #ov-toolbar, #ov-chips { gap: 4px 7px !important; padding-left: 7px !important; padding-right: 7px !important; }
       .ov-view { padding: 4px 8px !important; }
-      .ov-view-n, .ov-filters-lbl { display: none !important; }
+      .ov-view-n { display: none !important; }
       .ov-live { padding: 2px 6px !important; }
     }
     @container (max-width: 520px) {
       .ov-list-head, .ov-row { grid-template-columns: 46px minmax(0,1fr) 40px 52px 44px !important; }
       .ov-c-init, .ov-lh-init { display: none !important; }
-    }
-    /* At the smallest supported footprint one toolbar line cannot hold eight
-       controls, so search and filters take a second line rather than clipping. */
-    @container (max-width: 430px) {
-      #ov-header { flex-wrap: wrap !important; gap: 5px !important; padding: 7px 6px !important; }
-      #ov-actions { margin-left: auto !important; }
-      .ov-search { order: 10 !important; flex: 1 1 60% !important; }
-      .ov-filters-btn { order: 11 !important; }
-      #ov-chips, .ov-menu { top: 76px !important; }
-      .ov-view { padding: 4px 8px !important; }
     }
     @container (max-width: 400px) {
       .ov-list-head, .ov-row { grid-template-columns: 42px minmax(0,1fr) 38px 40px !important; }
@@ -3600,7 +3566,9 @@ function injectStyles(): void {
     /* ══ Docked inspector ═══════════════════════════════════════════════════ */
     #ov-dock {
       flex: 0 0 auto !important;
-      max-height: 58% !important;
+      /* Three rows of chrome sit above the log now, so the dock takes less of
+         what is left — the log has to stay usable while the inspector is open. */
+      max-height: 50% !important;
       display: flex !important;
       flex-direction: column !important;
       overflow: hidden !important;
@@ -4096,6 +4064,8 @@ function injectStyles(): void {
     .ov-resize-handle[data-dir="se"] { bottom:0 !important; right:0 !important; width:8px !important; height:8px !important; cursor:se-resize !important; }
 
     /* ══ Minimized / ambient pill ═══════════════════════════════════════════ */
+    /* A light capsule with a soft halo: status dot, count, REQ, a dense activity
+       band, and the expand affordance. No wordmark — the shape is the identity. */
     #ov-pill {
       all: initial;
       position: fixed !important;
@@ -4104,66 +4074,90 @@ function injectStyles(): void {
       z-index: 2147483646 !important;
       display: flex !important;
       align-items: center !important;
-      gap: 10px !important;
-      padding: 8px 12px !important;
-      background: #12161c !important;
-      border: 1px solid #2a333f !important;
-      border-radius: 12px !important;
+      gap: 9px !important;
+      padding: 9px 16px !important;
+      background: #ffffff !important;
+      border: 0 !important;
+      border-radius: 999px !important;
       font-family: var(--ov-font-family,'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace) !important;
       font-size: calc(11px * var(--ov-font-scale,1)) !important;
-      color: #eef2f7 !important;
-      cursor: move !important;
-      box-shadow: 0 18px 40px -14px rgba(0,0,0,.75) !important;
-      user-select: none !important;
-      --ov-mark: linear-gradient(135deg,#5b8cff,#8a5bff);
-      --ov-mark-fg: #0a0c0f;
-      --ov-r-sm: 5px;
-    }
-    #ov-pill[data-theme="light"] {
-      background: #ffffff !important;
-      border-color: #dce1e8 !important;
       color: #1c2530 !important;
-      box-shadow: 0 18px 40px -14px rgba(20,30,50,.3) !important;
-      --ov-mark: linear-gradient(135deg,#3b6fe0,#7c3aed);
-      --ov-mark-fg: #ffffff;
+      cursor: move !important;
+      /* Tight contact shadow, wide diffuse halo, and a hairline ring so the
+         capsule still reads against a white page. */
+      box-shadow:
+        0 0 0 1px rgba(20,30,50,.06),
+        0 2px 6px -1px rgba(20,30,50,.10),
+        0 10px 28px -6px rgba(20,30,50,.16),
+        0 0 0 7px rgba(20,30,50,.035) !important;
+      user-select: none !important;
+    }
+    #ov-pill[data-theme="dark"] {
+      background: #12161c !important;
+      color: #eef2f7 !important;
+      box-shadow:
+        0 0 0 1px rgba(255,255,255,.07),
+        0 2px 6px -1px rgba(0,0,0,.5),
+        0 10px 28px -6px rgba(0,0,0,.6),
+        0 0 0 7px rgba(255,255,255,.03) !important;
     }
     .ov-pill-dot {
-      width: 7px !important; height: 7px !important;
+      width: 8px !important; height: 8px !important;
       border-radius: 50% !important;
-      background: #4ec9a5 !important;
+      background: #22c58b !important;
       flex-shrink: 0 !important;
       animation: ov-pulse 1.6s infinite !important;
     }
     .ov-pill-dot.ov-pill-paused { background: #d9a441 !important; animation: none !important; }
-    .ov-pill-count { font-weight: 600 !important; font-size: calc(13px * var(--ov-font-scale,1)) !important; }
+    .ov-pill-count {
+      font-weight: 700 !important;
+      font-size: calc(13px * var(--ov-font-scale,1)) !important;
+      font-variant-numeric: tabular-nums !important;
+    }
     .ov-pill-label {
-      color: #6b7684 !important;
-      font-size: calc(9px * var(--ov-font-scale,1)) !important;
+      color: #98a2ae !important;
+      font-size: calc(9.5px * var(--ov-font-scale,1)) !important;
       font-weight: 600 !important;
-      letter-spacing: .06em !important;
+      letter-spacing: .1em !important;
       text-transform: uppercase !important;
     }
-    .ov-pill-err { color: #e5615e !important; font-weight: 600 !important; font-size: calc(10px * var(--ov-font-scale,1)) !important; }
-    .ov-pill-rail { display: flex !important; gap: 2px !important; align-items: flex-end !important; height: 16px !important; }
+    #ov-pill[data-theme="dark"] .ov-pill-label { color: #6b7684 !important; }
+    .ov-pill-err {
+      color: #e5615e !important;
+      font-weight: 700 !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      font-variant-numeric: tabular-nums !important;
+    }
+    /* Uniform full-height bars, packed tight — an activity band, not a chart. */
+    .ov-pill-rail {
+      display: flex !important;
+      gap: 1.5px !important;
+      align-items: center !important;
+      height: 15px !important;
+    }
     .ov-pill-tick {
-      width: 3px !important;
-      background: #39434f !important;
-      border-radius: 1px !important;
+      width: 2px !important;
+      height: 15px !important;
+      background: #1c2530 !important;
+      border-radius: 0 !important;
       flex-shrink: 0 !important;
     }
-    .ov-pill-tick.ok   { background: #4ec9a5 !important; }
+    #ov-pill[data-theme="dark"] .ov-pill-tick { background: #e4eaf1 !important; }
     .ov-pill-tick.err  { background: #e5615e !important; }
     .ov-pill-tick.warn { background: #d9a441 !important; }
-    .ov-pill-tick.ws   { background: #8fb0ff !important; }
+    .ov-pill-tick.ws   { background: #7c3aed !important; }
+    #ov-pill[data-theme="dark"] .ov-pill-tick.ws { background: #8fb0ff !important; }
     .ov-pill-expand {
       all: unset !important;
       cursor: pointer !important;
-      font-size: calc(12px * var(--ov-font-scale,1)) !important;
-      color: #39434f !important;
-      padding: 0 2px !important;
+      font-size: calc(13px * var(--ov-font-scale,1)) !important;
+      color: #98a2ae !important;
+      padding: 0 1px !important;
       line-height: 1 !important;
     }
-    .ov-pill-expand:hover { color: #5b8cff !important; }
+    .ov-pill-expand:hover { color: #2563eb !important; }
+    #ov-pill[data-theme="dark"] .ov-pill-expand { color: #6b7684 !important; }
+    #ov-pill[data-theme="dark"] .ov-pill-expand:hover { color: #8fb0ff !important; }
 
     /* ══ Ghost mode ═════════════════════════════════════════════════════════ */
     .ov-ghost { opacity: 0.25 !important; transition: opacity 100ms !important; pointer-events: auto !important; }
@@ -4575,8 +4569,7 @@ function deactivateOverlay(): void {
   preActivationBuffer.length = 0;
   dockState = 'panel';
   currentView = 'log';
-  filtersOpen = false;
-  settingsOpen = false;
+  searchOpen = false;
   ghostHeld = false;
 }
 

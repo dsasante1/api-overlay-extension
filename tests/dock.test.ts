@@ -60,9 +60,12 @@ describe('setDockState', () => {
   it('renders request counts into the pill', () => {
     seed(req({ id: 1, status: 200 }), req({ id: 2, status: 500 }))
     ov.setDockState('pill')
-    const text = pill()?.textContent ?? ''
-    expect(text).toContain('2')
-    expect(text).toContain('1⚠')
+    const text = (pill()?.textContent ?? '').replace(/\s+/g, ' ')
+    expect(text).toContain('2 req')
+    expect(pill()?.querySelector('.ov-pill-err')?.textContent).toBe('1')
+    // One bar per recent request, error-coloured where the call failed.
+    expect(pill()?.querySelectorAll('.ov-pill-tick')).toHaveLength(2)
+    expect(pill()?.querySelectorAll('.ov-pill-tick.err')).toHaveLength(1)
   })
 })
 
@@ -249,29 +252,75 @@ describe('view switching', () => {
   })
 })
 
-describe('filters popover', () => {
-  const chips = () => document.getElementById('ov-chips')
-  const filtersBtn = () => document.getElementById('ov-filters-btn')
-
-  it('stays shut until the Filters button is clicked', () => {
-    expect(chips()?.hasAttribute('hidden')).toBe(true)
-    filtersBtn()!.click()
-    expect(chips()?.hasAttribute('hidden')).toBe(false)
-    filtersBtn()!.click()
-    expect(chips()?.hasAttribute('hidden')).toBe(true)
+describe('toolbar', () => {
+  it('keeps every capture control on the panel, not behind a menu', () => {
+    for (const id of ['ov-pause', 'ov-clear', 'ov-theme', 'ov-export', 'ov-collapse']) {
+      expect(document.getElementById(id), id).not.toBeNull()
+    }
+    expect(document.getElementById('ov-settings')).toBeNull()
   })
 
-  it('badges the number of active chip filters', () => {
-    seed(req({ id: 1, method: 'GET', status: 200 }))
-    const badge = document.getElementById('ov-filters-n')!
-    expect(badge.hasAttribute('hidden')).toBe(true)
+  it('shows all filter chips permanently', () => {
+    expect(document.getElementById('ov-chips')?.hasAttribute('hidden')).toBe(false)
+    expect(document.getElementById('ov-filters-btn')).toBeNull()
+    expect(document.querySelectorAll('#ov-chips .ov-chip')).toHaveLength(12)
+  })
 
-    filtersBtn()!.click()
-    document.querySelector<HTMLButtonElement>('.ov-chip[data-s="2xx"]')!.click()
-    document.querySelector<HTMLButtonElement>('.ov-chip[data-m="GET"]')!.click()
+  it('filters the log from a chip without any disclosure step', () => {
+    seed(req({ id: 1, method: 'GET' }), req({ id: 2, method: 'POST' }))
+    document.querySelector<HTMLButtonElement>('.ov-chip[data-m="POST"]')!.click()
+    const ids = [...document.querySelectorAll('#ov-list .ov-row')]
+      .map(el => (el as HTMLElement).dataset.id)
+    expect(ids).toEqual(['2'])
+  })
+})
 
-    expect(badge.hasAttribute('hidden')).toBe(false)
-    expect(badge.textContent).toBe('2')
+describe('collapsible search', () => {
+  const box = () => document.getElementById('ov-search')
+  const searchBtn = () => document.getElementById('ov-search-btn')
+  const field = () => document.getElementById('ov-filter') as HTMLInputElement
+
+  it('starts collapsed and opens on the magnifying glass', () => {
+    expect(box()?.classList.contains('ov-search-open')).toBe(false)
+    expect(field().tabIndex).toBe(-1)
+
+    searchBtn()!.click()
+    expect(box()?.classList.contains('ov-search-open')).toBe(true)
+    expect(field().tabIndex).toBe(0)
+  })
+
+  it('actually filters the log once open', () => {
+    seed(req({ id: 1, url: 'https://a.test/alpha' }), req({ id: 2, url: 'https://a.test/bravo' }))
+    searchBtn()!.click()
+    field().value = 'bravo'
+    field().dispatchEvent(new Event('input'))
+    ov.renderList()
+
+    const ids = [...document.querySelectorAll('#ov-list .ov-row')]
+      .map(el => (el as HTMLElement).dataset.id)
+    expect(ids).toEqual(['2'])
+    expect(document.getElementById('ov-hits')?.textContent).toBe('1 hit')
+  })
+
+  it('drops the term when closed, so no hidden filter survives', () => {
+    seed(req({ id: 1, url: 'https://a.test/alpha' }), req({ id: 2, url: 'https://a.test/bravo' }))
+    searchBtn()!.click()
+    field().value = 'bravo'
+    field().dispatchEvent(new Event('input'))
+    ov.renderList()
+
+    document.getElementById('ov-search-clear')!.click()
+    expect(field().value).toBe('')
+    expect(document.querySelectorAll('#ov-list .ov-row')).toHaveLength(2)
+  })
+
+  it('does not let the header drag swallow focus from the field', () => {
+    // The toolbar is a drag handle; preventDefault on its mousedown would stop
+    // the input ever taking focus, which is what made search unusable.
+    searchBtn()!.click()
+    const ev = new MouseEvent('mousedown', { bubbles: true, cancelable: true })
+    field().dispatchEvent(ev)
+    expect(ev.defaultPrevented).toBe(false)
   })
 })
 
