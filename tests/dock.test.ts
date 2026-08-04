@@ -275,26 +275,24 @@ describe('toolbar', () => {
   })
 })
 
-describe('collapsible search', () => {
-  const box = () => document.getElementById('ov-search')
-  const searchBtn = () => document.getElementById('ov-search-btn')
+describe('search field', () => {
   const field = () => document.getElementById('ov-filter') as HTMLInputElement
 
-  it('starts collapsed and opens on the magnifying glass', () => {
-    expect(box()?.classList.contains('ov-search-open')).toBe(false)
-    expect(field().tabIndex).toBe(-1)
+  const type = (term: string) => {
+    field().value = term
+    field().dispatchEvent(new Event('input'))
+    ov.renderList()
+  }
 
-    searchBtn()!.click()
-    expect(box()?.classList.contains('ov-search-open')).toBe(true)
+  it('sits on its own row, visible without a disclosure', () => {
+    expect(document.querySelector('#ov-toolbar #ov-search')).not.toBeNull()
+    expect(document.getElementById('ov-search-btn')).toBeNull()
     expect(field().tabIndex).toBe(0)
   })
 
-  it('actually filters the log once open', () => {
+  it('filters the log and reports the hit count', () => {
     seed(req({ id: 1, url: 'https://a.test/alpha' }), req({ id: 2, url: 'https://a.test/bravo' }))
-    searchBtn()!.click()
-    field().value = 'bravo'
-    field().dispatchEvent(new Event('input'))
-    ov.renderList()
+    type('bravo')
 
     const ids = [...document.querySelectorAll('#ov-list .ov-row')]
       .map(el => (el as HTMLElement).dataset.id)
@@ -302,22 +300,18 @@ describe('collapsible search', () => {
     expect(document.getElementById('ov-hits')?.textContent).toBe('1 hit')
   })
 
-  it('drops the term when closed, so no hidden filter survives', () => {
+  it('clears the term on Escape', () => {
     seed(req({ id: 1, url: 'https://a.test/alpha' }), req({ id: 2, url: 'https://a.test/bravo' }))
-    searchBtn()!.click()
-    field().value = 'bravo'
-    field().dispatchEvent(new Event('input'))
-    ov.renderList()
+    type('bravo')
 
-    document.getElementById('ov-search-clear')!.click()
+    field().dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     expect(field().value).toBe('')
     expect(document.querySelectorAll('#ov-list .ov-row')).toHaveLength(2)
   })
 
-  it('does not let the header drag swallow focus from the field', () => {
+  it('does not let the toolbar drag swallow focus from the field', () => {
     // The toolbar is a drag handle; preventDefault on its mousedown would stop
     // the input ever taking focus, which is what made search unusable.
-    searchBtn()!.click()
     const ev = new MouseEvent('mousedown', { bubbles: true, cancelable: true })
     field().dispatchEvent(ev)
     expect(ev.defaultPrevented).toBe(false)

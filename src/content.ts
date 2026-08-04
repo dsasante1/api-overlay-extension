@@ -160,9 +160,6 @@ type PillGeom = { left: number; top: number };
 let savedPanelGeom: PanelGeom | null = null;
 let savedPillGeom: PillGeom | null = null;
 let currentView: OverlayView = 'log';
-// The search field starts collapsed to its magnifying glass; every other control
-// is on the toolbar permanently.
-let searchOpen = false;
 let ghostHeld = false;
 let ghostTimer: number | null = null;
 let clusterOutsideClickHandler: ((e: MouseEvent) => void) | null = null;
@@ -551,7 +548,7 @@ function setPaused(next: boolean): void {
   chrome.storage.local.set({ ovPaused: paused });
   signalInjected(paused ? 'pause' : 'resume');
   const btn = $('ov-pause');
-  if (btn) btn.textContent = paused ? '▶' : '⏸';
+  if (btn) btn.textContent = paused ? '▶ rec' : '⏸ pause';
   // Drives the live badge's paused colouring and the footer's capture note.
   $('ov-panel')?.classList.toggle('ov-paused', paused);
   refreshPill();
@@ -2281,11 +2278,14 @@ function buildPanel(): void {
       <span id="ov-live" class="ov-live"><span class="ov-live-dot"></span><span id="ov-count">0/0</span></span>
       <div class="ov-hdr-spacer"></div>
       <div id="ov-actions">
-        <button id="ov-pause" data-tip="Pause or resume capturing">${paused ? '▶' : '⏸'}</button>
-        <button id="ov-clear" data-tip="Clear all requests">🗑</button>
-        <button id="ov-theme" data-tip="Toggle dark / light theme">◐</button>
-        <button id="ov-export" data-tip="Export as HAR file">↓</button>
-        <button id="ov-collapse" data-tip="Minimize" data-tip-align="right">▁</button>
+        <button id="ov-pause" data-tip="Pause or resume capturing">${paused ? '▶ rec' : '⏸ pause'}</button>
+        <span class="ov-divider"></span>
+        <button id="ov-theme" data-tip="Toggle dark / light theme">${currentTheme === 'dark' ? 'light' : 'dark'}</button>
+        <span class="ov-divider"></span>
+        <button id="ov-export" data-tip="Export as HAR file">↓ har</button>
+        <span class="ov-divider"></span>
+        <button id="ov-clear" data-tip="Clear all requests">✕ clear</button>
+        <button id="ov-collapse" data-tip="Minimize" data-tip-align="right">_</button>
       </div>
     </div>
     <div id="ov-toolbar">
@@ -2294,43 +2294,37 @@ function buildPanel(): void {
         <button class="ov-view" data-v="pinned" data-tip="Pinned requests">Pinned<span class="ov-view-n" id="ov-view-pin-n">0</span></button>
         <button class="ov-view" data-v="map" data-tip="Site map — pages to endpoints">Map</button>
       </div>
-      <div class="ov-hdr-spacer"></div>
       <div id="ov-search" class="ov-search">
-        <button id="ov-search-btn" class="ov-search-btn" data-tip="Search url, request and response" data-tip-align="right">⌕</button>
-        <input id="ov-filter" placeholder="url · request · response" autocomplete="off" spellcheck="false" tabindex="-1"/>
+        <span class="ov-prompt">›</span>
+        <input id="ov-filter" placeholder="filter url, body, header…" autocomplete="off" spellcheck="false"/>
         <span id="ov-hits" class="ov-hits"></span>
-        <button id="ov-case-toggle" class="ov-modebtn" data-tip="Case-sensitive" data-tip-align="right" tabindex="-1">Aa</button>
-        <button id="ov-regex-toggle" class="ov-modebtn" data-tip="Regular expression" data-tip-align="right" tabindex="-1">.*</button>
-        <button id="ov-search-clear" class="ov-search-clear" data-tip="Close search" data-tip-align="right" tabindex="-1">✕</button>
+        <button id="ov-case-toggle" class="ov-modebtn" data-tip="Case-sensitive" data-tip-align="right">Aa</button>
+        <button id="ov-regex-toggle" class="ov-modebtn" data-tip="Regular expression" data-tip-align="right">.*</button>
       </div>
     </div>
     <div id="ov-chips">
       <div class="ov-chip-group">
         <span class="ov-chip-label">status</span>
-        <div class="ov-chip-set">
-          <button class="ov-chip ov-chip-pill" data-s="2xx" data-tip="Filter: 2xx success">2xx<span class="ov-chip-count">0</span></button>
-          <button class="ov-chip ov-chip-pill" data-s="3xx" data-tip="Filter: 3xx redirects">3xx<span class="ov-chip-count">0</span></button>
-          <button class="ov-chip ov-chip-pill" data-s="4xx" data-tip="Filter: 4xx client errors">4xx<span class="ov-chip-count">0</span></button>
-          <button class="ov-chip ov-chip-pill" data-s="5xx" data-tip="Filter: 5xx server errors">5xx<span class="ov-chip-count">0</span></button>
-        </div>
+        <button class="ov-chip" data-s="2xx" data-tip="Filter: 2xx success">2xx<span class="ov-chip-count">0</span></button>
+        <button class="ov-chip" data-s="3xx" data-tip="Filter: 3xx redirects">3xx<span class="ov-chip-count">0</span></button>
+        <button class="ov-chip" data-s="4xx" data-tip="Filter: 4xx client errors">4xx<span class="ov-chip-count">0</span></button>
+        <button class="ov-chip" data-s="5xx" data-tip="Filter: 5xx server errors">5xx<span class="ov-chip-count">0</span></button>
       </div>
+      <span class="ov-chip-sep"></span>
       <div class="ov-chip-group">
         <span class="ov-chip-label">method</span>
-        <div class="ov-chip-set">
-          <button class="ov-chip" data-m="GET" data-tip="Filter: GET requests">GET</button>
-          <button class="ov-chip" data-m="POST" data-tip="Filter: POST requests">POST</button>
-          <button class="ov-chip" data-m="PUT" data-tip="Filter: PUT requests">PUT</button>
-          <button class="ov-chip" data-m="PATCH" data-tip="Filter: PATCH requests">PATCH</button>
-          <button class="ov-chip" data-m="DELETE" data-tip="Filter: DELETE requests">DEL</button>
-          <button class="ov-chip" data-m="WS" data-tip="Filter: WebSocket connections">WS</button>
-        </div>
+        <button class="ov-chip" data-m="GET" data-tip="Filter: GET requests">GET</button>
+        <button class="ov-chip" data-m="POST" data-tip="Filter: POST requests">POST</button>
+        <button class="ov-chip" data-m="PUT" data-tip="Filter: PUT requests">PUT</button>
+        <button class="ov-chip" data-m="PATCH" data-tip="Filter: PATCH requests">PATCH</button>
+        <button class="ov-chip" data-m="DELETE" data-tip="Filter: DELETE requests">DEL</button>
+        <button class="ov-chip" data-m="WS" data-tip="Filter: WebSocket connections">WS</button>
       </div>
+      <span class="ov-chip-sep"></span>
       <div class="ov-chip-group">
-        <span class="ov-chip-label">initiator</span>
-        <div class="ov-chip-set">
-          <button class="ov-chip ov-chip-wide" data-i="page" data-tip="Requests a page element triggered">◍ user</button>
-          <button class="ov-chip ov-chip-wide" data-i="bg" data-tip="Background / automatic requests">◌ background</button>
-        </div>
+        <span class="ov-chip-label">from</span>
+        <button class="ov-chip" data-i="page" data-tip="Requests a page element triggered">page</button>
+        <button class="ov-chip" data-i="bg" data-tip="Background / automatic requests">bg</button>
       </div>
     </div>
     <div id="ov-list"></div>
@@ -2421,36 +2415,14 @@ function bindViewTabs(container: HTMLElement): void {
   });
 }
 
-// The search box is a magnifying glass until it is needed, so the toolbar keeps
-// its width for the view tabs. Opening focuses the field; closing clears the
-// term, because a hidden filter silently shrinking the log is a trap.
-function setSearchOpen(open: boolean): void {
-  searchOpen = open;
-  const box = $('ov-search');
-  box?.classList.toggle('ov-search-open', open);
-  $('ov-search-btn')?.classList.toggle('ov-active', open);
-  // Keep the collapsed controls out of the tab order.
-  for (const el of box?.querySelectorAll<HTMLElement>('input, .ov-modebtn, .ov-search-clear') ?? []) {
-    el.tabIndex = open ? 0 : -1;
-  }
-  if (open) {
-    filterInput?.focus();
-    return;
-  }
-  if (filterInput?.value) {
+// Escape clears the term from inside the field — the usual way to abandon a
+// search without reaching for the mouse.
+function bindSearchToggle(): void {
+  filterInput?.addEventListener('keydown', (e: KeyboardEvent) => {
+    if (e.key !== 'Escape' || !filterInput?.value) return;
+    e.stopPropagation();
     filterInput.value = '';
     renderList();
-  }
-}
-
-function bindSearchToggle(): void {
-  const btn = $('ov-search-btn');
-  if (btn) btn.onclick = () => setSearchOpen(!searchOpen);
-  const clear = $('ov-search-clear');
-  if (clear) clear.onclick = () => setSearchOpen(false);
-  // Escape closes the field from inside it, the usual way out of a search.
-  filterInput?.addEventListener('keydown', (e: KeyboardEvent) => {
-    if (e.key === 'Escape') { e.stopPropagation(); setSearchOpen(false); }
   });
 }
 
@@ -3129,12 +3101,12 @@ function injectStyles(): void {
       font-family: inherit !important;
     }
     .ov-hdr-title {
-      font-weight: 600 !important;
-      font-size: calc(12px * var(--ov-font-scale,1)) !important;
+      font-weight: 700 !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       color: var(--ov-title) !important;
-      letter-spacing: -0.01em !important;
+      letter-spacing: .1em !important;
+      text-transform: uppercase !important;
       flex-shrink: 0 !important;
-      font-family: var(--ov-font-family,'IBM Plex Sans',system-ui,sans-serif) !important;
     }
     .ov-live {
       display: inline-flex !important;
@@ -3204,7 +3176,7 @@ function injectStyles(): void {
     }
     .ov-view-n[hidden] { display: none !important; }
 
-    /* ── Second row: views + search ── */
+    /* ── Second row: the filter field, its own full-width line ── */
     #ov-toolbar {
       display: flex !important;
       align-items: center !important;
@@ -3216,56 +3188,27 @@ function injectStyles(): void {
       cursor: move !important;
       user-select: none !important;
     }
-
-    /* ── Search: a magnifying glass that opens into a field ── */
     .ov-search {
       display: flex !important;
       align-items: center !important;
-      gap: 6px !important;
-      height: 28px !important;
-      background: transparent !important;
-      border: 1px solid transparent !important;
-      border-radius: 8px !important;
-      padding: 0 !important;
-      flex: 0 0 auto !important;
-      transition: flex-basis 120ms ease, background 120ms, border-color 120ms !important;
-    }
-    .ov-search.ov-search-open {
+      gap: 7px !important;
       flex: 1 1 auto !important;
       min-width: 0 !important;
+      height: 28px !important;
       background: var(--ov-bg) !important;
-      border-color: var(--ov-border) !important;
-      padding: 0 5px 0 2px !important;
-    }
-    .ov-search.ov-search-open:focus-within { border-color: var(--ov-accent-bd) !important; }
-    .ov-search-btn {
-      all: unset !important;
-      cursor: pointer !important;
-      display: flex !important;
-      align-items: center !important;
-      justify-content: center !important;
-      width: 26px !important;
-      height: 26px !important;
-      flex: none !important;
-      border-radius: var(--ov-r) !important;
       border: 1px solid var(--ov-border) !important;
-      background: var(--ov-bg-3) !important;
-      color: var(--ov-text-dim) !important;
-      font-size: calc(13px * var(--ov-font-scale,1)) !important;
-      font-family: inherit !important;
-      transition: color 90ms, border-color 90ms !important;
+      border-radius: var(--ov-r) !important;
+      padding: 0 7px 0 9px !important;
     }
-    .ov-search-btn:hover { color: var(--ov-title) !important; border-color: var(--ov-text-faint) !important; }
-    .ov-search-open .ov-search-btn {
-      border-color: transparent !important;
-      background: transparent !important;
+    .ov-search:focus-within { border-color: var(--ov-accent-bd) !important; }
+    .ov-prompt {
       color: var(--ov-text-faint) !important;
+      font-size: calc(12px * var(--ov-font-scale,1)) !important;
+      flex-shrink: 0 !important;
     }
-    /* Base appearance for everything inside the box. Every 'all: unset' has to
-       land before the collapse rules below — in a later rule it resets the very
-       properties the collapsed state sets, and the field never folds away. */
     #ov-filter {
       all: unset !important;
+      flex: 1 1 auto !important;
       min-width: 0 !important;
       color: var(--ov-text) !important;
       font-size: calc(11px * var(--ov-font-scale,1)) !important;
@@ -3273,75 +3216,50 @@ function injectStyles(): void {
     }
     #ov-filter::placeholder { color: var(--ov-text-ghost) !important; }
     #ov-filter.ov-filter-invalid { color: var(--ov-s-err) !important; }
-    .ov-search-clear {
-      all: unset !important;
-      cursor: pointer !important;
-      flex: none !important;
-      color: var(--ov-text-faint) !important;
-      font-size: calc(11px * var(--ov-font-scale,1)) !important;
-      font-family: inherit !important;
-      border-radius: var(--ov-r-sm) !important;
-    }
-    .ov-search-clear:hover { color: var(--ov-s-err) !important; }
-    .ov-modebtn {
-      all: unset !important;
-      cursor: pointer !important;
-      font-size: calc(10px * var(--ov-font-scale,1)) !important;
-      font-weight: 600 !important;
-      font-family: inherit !important;
-      color: var(--ov-text-faint) !important;
-      background: var(--ov-bg-3) !important;
-      border-radius: var(--ov-r-sm) !important;
-    }
-    .ov-modebtn:hover { color: var(--ov-text-dim) !important; }
-    .ov-modebtn.ov-active {
-      color: var(--ov-text-dim) !important;
-      background: var(--ov-border) !important;
-    }
     .ov-hits {
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
       color: var(--ov-text-faint) !important;
       white-space: nowrap !important;
       flex-shrink: 0 !important;
     }
-
-    /* Collapsed: the field and its modifiers fold away, leaving only the glass. */
-    .ov-search:not(.ov-search-open) #ov-filter,
-    .ov-search:not(.ov-search-open) .ov-modebtn,
-    .ov-search:not(.ov-search-open) .ov-search-clear,
-    .ov-search:not(.ov-search-open) .ov-hits {
-      display: none !important;
+    .ov-modebtn {
+      all: unset !important;
+      cursor: pointer !important;
+      padding: 2px 6px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      font-weight: 600 !important;
+      font-family: inherit !important;
+      color: var(--ov-text-faint) !important;
+      border-radius: var(--ov-r-sm) !important;
+      flex-shrink: 0 !important;
     }
-    .ov-search-open #ov-filter { flex: 1 1 auto !important; }
-    .ov-search-open .ov-modebtn,
-    .ov-search-open .ov-search-clear { padding: 2px 6px !important; }
+    .ov-modebtn:hover { color: var(--ov-text-dim) !important; background: var(--ov-bg-3) !important; }
+    .ov-modebtn.ov-active {
+      color: var(--ov-accent-soft) !important;
+      background: var(--ov-accent-bg) !important;
+    }
 
-    /* ── Icon actions ── */
-    #ov-actions { display: flex !important; align-items: center !important; gap: 3px !important; flex-shrink: 0 !important; }
+    /* ── Text actions, separated by rules ── */
+    #ov-actions { display: flex !important; align-items: center !important; gap: 2px !important; flex-shrink: 0 !important; }
     #ov-actions button {
       all: unset !important;
-      width: 26px !important;
-      height: 26px !important;
-      display: flex !important;
-      align-items: center !important;
-      justify-content: center !important;
-      border-radius: var(--ov-r) !important;
-      border: 1px solid var(--ov-border) !important;
-      background: var(--ov-bg-3) !important;
-      color: var(--ov-text-dim) !important;
       cursor: pointer !important;
-      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-text-muted) !important;
+      padding: 3px 7px !important;
+      border-radius: var(--ov-r-sm) !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       font-family: inherit !important;
-      transition: color 90ms, border-color 90ms, background 90ms !important;
+      white-space: nowrap !important;
+      transition: color 90ms, background 90ms !important;
     }
-    #ov-actions button:hover {
-      color: var(--ov-title) !important;
-      border-color: var(--ov-text-faint) !important;
-    }
-    #ov-actions button.ov-active {
-      color: var(--ov-accent) !important;
-      border-color: var(--ov-accent-bd) !important;
-      background: var(--ov-accent-bg) !important;
+    #ov-actions button:hover { color: var(--ov-title) !important; background: var(--ov-bg-3) !important; }
+    #ov-actions button.ov-active { color: var(--ov-accent) !important; background: var(--ov-accent-bg) !important; }
+    #ov-panel .ov-divider {
+      width: 1px !important;
+      height: 13px !important;
+      background: var(--ov-border) !important;
+      flex-shrink: 0 !important;
+      margin: 0 3px !important;
     }
 
     /* ══ Filter row ═════════════════════════════════════════════════════════ */
@@ -3356,20 +3274,28 @@ function injectStyles(): void {
       border-bottom: 1px solid var(--ov-border) !important;
       flex-shrink: 0 !important;
     }
+    /* Each group is its own flex run so a wrap never splits a label from the
+       chips it names. */
     .ov-chip-group {
       display: flex !important;
       align-items: center !important;
-      gap: 5px !important;
+      gap: 4px !important;
       min-width: 0 !important;
     }
     .ov-chip-label {
       font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      letter-spacing: .06em !important;
+      letter-spacing: .07em !important;
       text-transform: uppercase !important;
       color: var(--ov-text-ghost) !important;
       flex-shrink: 0 !important;
+      margin-right: 2px !important;
     }
-    .ov-chip-set { display: flex !important; gap: 3px !important; flex-wrap: wrap !important; }
+    .ov-chip-sep {
+      width: 1px !important;
+      height: 13px !important;
+      background: var(--ov-border) !important;
+      flex-shrink: 0 !important;
+    }
     .ov-chip {
       all: unset !important;
       cursor: pointer !important;
@@ -3384,8 +3310,6 @@ function injectStyles(): void {
       white-space: nowrap !important;
       transition: color 90ms, border-color 90ms, background 90ms !important;
     }
-    .ov-chip-pill { border-radius: 20px !important; }
-    .ov-chip-wide { flex: 1 !important; text-align: center !important; }
     .ov-chip:hover { color: var(--ov-text-dim) !important; border-color: var(--ov-text-faint) !important; }
     .ov-chip.on {
       border-color: var(--ov-accent-bd) !important;
@@ -3540,18 +3464,22 @@ function injectStyles(): void {
     /* Narrow panel: the initiator column is the first to go, then the duration.
        A hidden cell stops being a grid item, so each breakpoint drops the matching
        track too — leave the counts out of step and every later column shifts. */
-    /* The chips name their own dimension ("2xx", "GET"), so the group labels are
-       the first thing to give up width when the row would otherwise wrap again. */
-    @container (max-width: 600px) {
-      .ov-chip-label { display: none !important; }
-      #ov-chips { gap: 4px 12px !important; }
-    }
-    @container (max-width: 440px) {
+    /* The wordmark goes before anything functional does — the C mark still
+       identifies the panel, and the row needs its width for the controls. */
+    @container (max-width: 430px) {
       .ov-hdr-title { display: none !important; }
-      #ov-header, #ov-toolbar, #ov-chips { gap: 4px 7px !important; padding-left: 7px !important; padding-right: 7px !important; }
+    }
+    /* Then the chips give up their group labels: a chip reading "2xx" or "GET"
+       already names its own dimension. */
+    @container (max-width: 470px) {
+      .ov-chip-label, .ov-chip-sep { display: none !important; }
+      #ov-chips { gap: 4px 6px !important; }
+      #ov-header, #ov-toolbar, #ov-chips { padding-left: 7px !important; padding-right: 7px !important; }
+      #ov-header { gap: 6px !important; }
       .ov-view { padding: 4px 8px !important; }
       .ov-view-n { display: none !important; }
       .ov-live { padding: 2px 6px !important; }
+      #ov-actions button { padding: 3px 5px !important; }
     }
     @container (max-width: 520px) {
       .ov-list-head, .ov-row { grid-template-columns: 46px minmax(0,1fr) 40px 52px 44px !important; }
@@ -4569,7 +4497,6 @@ function deactivateOverlay(): void {
   preActivationBuffer.length = 0;
   dockState = 'panel';
   currentView = 'log';
-  searchOpen = false;
   ghostHeld = false;
 }
 
