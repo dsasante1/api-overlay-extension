@@ -27,7 +27,6 @@
 
 type SmTier = 'observed' | 'declared' | 'inferred';
 type SmPageSource = 'visited' | 'link' | 'sitemap';
-type SmView = 'log' | 'map';
 
 interface SmCandidate { url: string; method: string }
 
@@ -87,11 +86,13 @@ const smShared = new Map<string, SmEndpoint>();
 // Scanned once, reused across pages: SPA bundles are shared by every route.
 const smScriptCache = new Map<string, SmCandidate[]>();
 
-let smView: SmView = 'log';
 let smBuilding = false;
 let smAbort = false;
 let smBuiltAt = 0;
 let smStatus = '';
+// Build progress as a fraction, or -1 while the work is unbounded (discovery and
+// doc-reading have no denominator until the page list is known).
+let smProgress = -1;
 let smScanningRoute = '';
 // UI expansion state, keyed by route / `${route} ${host}`.
 const smExpandedPages = new Set<string>();
@@ -671,8 +672,9 @@ async function smInferPage(page: SmPage): Promise<void> {
   }
 }
 
-function smSetStatus(text: string): void {
+function smSetStatus(text: string, progress = -1): void {
   smStatus = text;
+  smProgress = progress;
   smRenderSiteMap();
 }
 
@@ -696,11 +698,12 @@ async function smBuildMap(): Promise<void> {
 
     const targets = [...smPages.values()].filter(p => !p.scanned && !p.inferred);
     let done = 0;
-    smSetStatus(`reading page source 0/${targets.length}…`);
+    smSetStatus(`reading page source 0/${targets.length}…`, 0);
     await smPool(targets, SM_INFER_CONCURRENCY, async p => {
       await smInferPage(p);
       done++;
       smStatus = `reading page source ${done}/${targets.length}…`;
+      smProgress = done / Math.max(1, targets.length);
       if (done % 4 === 0) smRenderSiteMap();
     });
 
@@ -711,6 +714,7 @@ async function smBuildMap(): Promise<void> {
     // next open would show a half-finished map instead of rebuilding.
     if (!smAbort) smBuiltAt = Date.now();
     smStatus = '';
+    smProgress = -1;
     smRenderSiteMap();
   }
 }
@@ -795,6 +799,7 @@ function smEndpointRowHtml(ep: SmEndpoint, route: string): string {
     <span class="ov-sm-m m-${safeMethodClass(method === '?' ? 'GET' : method)}${method === '?' ? ' ov-sm-m-unk' : ''}">${escHtml(method)}</span>
     <span class="ov-sm-url">${escHtml(ep.template)}</span>
     ${ep.interactive ? '<span class="ov-sm-zap" title="triggered by a user interaction">⚡</span>' : ''}
+    <i class="ov-sm-sw ov-sm-sw-${ep.tier}" title="${ep.tier}"></i>
     ${count}${statusHtml}<span class="ov-sm-ms">${escHtml(ms)}</span>
   </div>`;
 }
@@ -838,17 +843,21 @@ function smThirdPartyHtml(groups: SmHostGroup[], route: string): string {
 function smPageHtml(page: SmPage): string {
   const open = smExpandedPages.has(page.route);
   const eps = [...page.endpoints.values()];
-  const badge = page.scanned
-    ? '<span class="ov-sm-badge ov-sm-badge-obs">visited</span>'
-    : page.inferred
-      ? '<span class="ov-sm-badge ov-sm-badge-inf">inferred</span>'
-      : '<span class="ov-sm-badge">not scanned</span>';
+  let badge = '<span class="ov-sm-badge">not scanned</span>';
+  if (page.scanned) badge = '<span class="ov-sm-badge ov-sm-badge-obs">visited</span>';
+  else if (page.inferred) badge = '<span class="ov-sm-badge ov-sm-badge-inf">inferred</span>';
   const err = page.error ? `<span class="ov-sm-err">${escHtml(page.error)}</span>` : '';
   const scanning = smScanningRoute === page.route;
-  const scanBtn = page.scanned
-    ? ''
-    : `<button class="ov-sm-scan" data-route="${escHtml(page.route)}"${scanning || smScanningRoute ? ' disabled' : ''}
+  // Routes that look destructive are never loaded, so say so where the scan
+  // control would otherwise be rather than refusing after the click.
+  const denied = smIsDeniedPath(page.url);
+  let scanBtn = '';
+  if (denied) {
+    scanBtn = '<span class="ov-sm-shield" data-tip="Logout, delete and reset routes are never loaded" data-tip-align="right">🛡 never scanned</span>';
+  } else if (!page.scanned) {
+    scanBtn = `<button class="ov-sm-scan" data-route="${escHtml(page.route)}"${scanning || smScanningRoute ? ' disabled' : ''}
         data-tip="Load this page in a background tab and capture its real calls" data-tip-align="right">${scanning ? '…' : 'scan'}</button>`;
+  }
 
   let body = '';
   if (open) {
@@ -896,6 +905,17 @@ function smCountEndpoints(): number {
   return n;
 }
 
+// Endpoints per confidence tier, for the legend's running totals.
+function smTierCounts(): { observed: number; declared: number; inferred: number } {
+  const out = { observed: 0, declared: 0, inferred: 0 };
+  for (const page of smPages.values()) {
+    for (const ep of page.endpoints.values()) out[ep.tier]++;
+  }
+  for (const ep of smDeclared.values()) out[ep.tier]++;
+  for (const ep of smShared.values()) out[ep.tier]++;
+  return out;
+}
+
 function smSiteMapHtml(): string {
   const pages = [...smPages.values()].sort((a, b) => {
     // Visited pages first — they're the ones with real data.
@@ -908,21 +928,32 @@ function smSiteMapHtml(): string {
     <span class="ov-sm-meta">${smPages.size} pages · ${smCountEndpoints()} endpoints</span>
     <span class="ov-sm-spacer"></span>
     ${smBuilding
-      ? '<button class="ov-sm-act" data-act="stop">stop</button>'
-      : '<button class="ov-sm-act" data-act="rebuild" data-tip="Re-run discovery" data-tip-pos="above">rebuild</button>'}
+      ? '<button class="ov-sm-act ov-sm-act-stop" data-act="stop">■ stop</button>'
+      : '<button class="ov-sm-act" data-act="rebuild" data-tip="Re-run discovery" data-tip-pos="above">↻ rebuild</button>'}
     <button class="ov-sm-act" data-act="export" data-tip="Export as Markdown" data-tip-pos="above">↓ md</button>
     <button class="ov-sm-act" data-act="close" data-tip="Back to the request log" data-tip-pos="above" data-tip-align="right">← log</button>
   </div>`;
 
+  const tiers = smTierCounts();
   const legend = `<div class="ov-sm-legend">
-    <span class="ov-tier-observed">■ observed</span>
-    <span class="ov-tier-declared">■ declared</span>
-    <span class="ov-tier-inferred">■ inferred</span>
+    <span class="ov-sm-tier ov-tier-observed"><i class="ov-sm-sw ov-sm-sw-observed"></i>observed <b>${tiers.observed}</b></span>
+    <span class="ov-sm-tier ov-tier-declared"><i class="ov-sm-sw ov-sm-sw-declared"></i>declared <b>${tiers.declared}</b></span>
+    <span class="ov-sm-tier ov-tier-inferred"><i class="ov-sm-sw ov-sm-sw-inferred"></i>inferred <b>${tiers.inferred}</b></span>
     <span class="ov-sm-spacer"></span>
     <span class="ov-sm-legend-note">inferred rows are candidates — click scan to verify</span>
   </div>`;
 
-  const status = smStatus ? `<div class="ov-sm-status">${escHtml(smStatus)}</div>` : '';
+  // While building: a spinner, the current step, and a determinate track once the
+  // page list gives the work a denominator.
+  const status = smStatus ? `<div class="ov-sm-status">
+      <div class="ov-sm-status-line">
+        ${smBuilding ? '<span class="ov-sm-spin"></span>' : ''}
+        <span class="ov-sm-status-text">${escHtml(smStatus)}</span>
+      </div>
+      ${smProgress >= 0
+        ? `<div class="ov-sm-track"><div class="ov-sm-fill" style="width:${Math.round(smProgress * 100)}%"></div></div>`
+        : ''}
+    </div>` : '';
 
   if (!pages.length && !smBuilding) {
     return `${bar}<div class="ov-empty">No site map yet.<br><small>Click ⊞ map in the header to build one.</small></div>`;
@@ -938,25 +969,12 @@ function smSiteMapHtml(): string {
   return bar + legend + status + sitewide + pages.map(p => smPageHtml(p)).join('');
 }
 
-// The status chips and the search box both act on the request log, so they'd be
-// dead controls over a site map. Hidden here rather than in smSetView so a panel
-// rebuilt while the map is open (pill → panel) comes back in the right state.
-function smApplyPanelChrome(): void {
-  const mapOpen = smView === 'map';
-  for (const id of ['ov-chips', 'ov-filter-row']) {
-    const el = document.getElementById(id);
-    if (el) el.style.setProperty('display', mapOpen ? 'none' : 'flex', 'important');
-  }
-}
-
+// The overlay owns which view is showing (log / pinned / map) and writes #ov-list
+// itself, so the map only asks for a re-render and lets renderList() pull the
+// HTML back out of smSiteMapHtml(). One writer for the list, one for the count.
 function smRenderSiteMap(): void {
-  if (smView !== 'map') return;
-  smApplyPanelChrome();
-  const list = document.getElementById('ov-list');
-  if (!list) return;
-  list.innerHTML = smSiteMapHtml();
-  const countEl = document.getElementById('ov-count');
-  if (countEl) countEl.textContent = `${smPages.size}p/${smCountEndpoints()}e`;
+  if (!siteMapVisible()) return;
+  renderList();
 }
 
 // ── Markdown export ───────────────────────────────────────────────────────────
@@ -1019,20 +1037,27 @@ function smExportMarkdown(): void {
   URL.revokeObjectURL(url);
 }
 
-// ── View switching + events ───────────────────────────────────────────────────
+// ── Build entry point + events ────────────────────────────────────────────────
 
-function smSetView(next: SmView): void {
-  if (smView === next) return;
-  smView = next;
-  const btn = document.getElementById('ov-sitemap');
-  if (btn) btn.classList.toggle('ov-active', next === 'map');
-  smApplyPanelChrome();
-  renderList();
+// Called when the Map view is opened and by its Build / rebuild control. Builds
+// once per activation unless the user explicitly asks for a rebuild.
+function smEnsureBuilt(): void {
+  if (!smBuiltAt && !smBuilding) void smBuildMap();
 }
 
-function smOpenSiteMap(): void {
-  smSetView('map');
-  if (!smBuiltAt && !smBuilding) void smBuildMap();
+function smRebuild(): void {
+  smBuiltAt = 0;
+  void smBuildMap();
+}
+
+function smIsBuilding(): boolean {
+  return smBuilding;
+}
+
+// Pages / endpoints discovered so far — shown in place of the request tally
+// while the Map view is open.
+function smTally(): { pages: number; endpoints: number } {
+  return { pages: smPages.size, endpoints: smCountEndpoints() };
 }
 
 let smEventsBound = false;
@@ -1042,7 +1067,6 @@ let smEventsBound = false;
 function smTeardown(): void {
   smReset();
   smEventsBound = false;
-  smView = 'log';
   smCaptureOnly = false;
 }
 
@@ -1051,17 +1075,17 @@ function smBindSiteMapDelegation(list: HTMLElement): void {
   smEventsBound = true;
 
   list.addEventListener('click', (e: Event) => {
-    if (smView !== 'map') return;
+    if (!siteMapVisible()) return;
     const target = e.target as HTMLElement;
 
     const act = target.closest<HTMLElement>('.ov-sm-act');
     if (act) {
       e.stopPropagation();
       const which = act.dataset.act;
-      if (which === 'close') smSetView('log');
+      if (which === 'close') setView('log');
       else if (which === 'export') smExportMarkdown();
       else if (which === 'stop') { smAbort = true; smSetStatus('stopped'); }
-      else if (which === 'rebuild') { smBuiltAt = 0; void smBuildMap(); }
+      else if (which === 'rebuild') smRebuild();
       return;
     }
 
@@ -1101,14 +1125,14 @@ function smBindSiteMapDelegation(list: HTMLElement): void {
       const ep = smPages.get(route)?.endpoints.get(key);
       const id = ep?.reqIds[0];
       if (typeof id === 'number' && requests.has(id)) {
-        smSetView('log');
+        setView('log');
         navigateToRequest(id);
       }
     }
   });
 
   list.addEventListener('mouseover', (e: Event) => {
-    if (smView !== 'map') return;
+    if (!siteMapVisible()) return;
     const row = (e.target as Element).closest<HTMLElement>('.ov-sm-ep');
     if (!row) return;
     const related = (e as MouseEvent).relatedTarget as Element | null;
@@ -1118,7 +1142,7 @@ function smBindSiteMapDelegation(list: HTMLElement): void {
   });
 
   list.addEventListener('mouseout', (e: Event) => {
-    if (smView !== 'map') return;
+    if (!siteMapVisible()) return;
     const row = (e.target as Element).closest<HTMLElement>('.ov-sm-ep');
     if (!row) return;
     const related = (e as MouseEvent).relatedTarget as Element | null;
@@ -1131,88 +1155,203 @@ function smBindSiteMapDelegation(list: HTMLElement): void {
 
 function smStylesCss(): string {
   return `
-    #ov-panel .ov-sm-bar, #ov-panel .ov-sm-legend {
+    /* ══ Site map ═══════════════════════════════════════════════════════════
+       Shares the overlay's tokens, so the palette and both themes come for free;
+       this only carries the geometry the map needs on top of them. */
+    #ov-panel .ov-sm-bar {
       display: flex !important; align-items: center !important; gap: 8px !important;
-      padding: 6px 10px !important; border-bottom: 1px solid var(--ov-grid) !important;
-      background: var(--ov-bg-2) !important; position: sticky !important; top: 0 !important; z-index: 3 !important;
+      padding: 9px 12px !important;
+      border-bottom: 1px solid var(--ov-border-soft) !important;
+      background: var(--ov-bg-2) !important;
+      position: sticky !important; top: 0 !important; z-index: 3 !important;
     }
-    #ov-panel .ov-sm-legend {
-      position: static !important; font-size: calc(9px * var(--ov-font-scale,1)) !important;
-      color: var(--ov-text-muted) !important; background: transparent !important;
+    #ov-panel .ov-sm-title {
+      color: var(--ov-title) !important; font-weight: 600 !important;
+      font-size: calc(11.5px * var(--ov-font-scale,1)) !important;
     }
-    #ov-panel .ov-sm-legend-note { color: var(--ov-text-faint) !important; }
-    #ov-panel .ov-sm-title { color: var(--ov-text) !important; font-weight: 600 !important; }
-    #ov-panel .ov-sm-meta { color: var(--ov-text-muted) !important; font-size: calc(10px * var(--ov-font-scale,1)) !important; }
+    #ov-panel .ov-sm-meta {
+      color: var(--ov-text-faint) !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important;
+    }
     #ov-panel .ov-sm-spacer { flex: 1 1 auto !important; }
     #ov-panel .ov-sm-act {
+      all: unset !important;
+      cursor: pointer !important;
       background: var(--ov-bg-3) !important; color: var(--ov-text-dim) !important;
-      border: 1px solid var(--ov-border) !important; border-radius: 2px !important;
-      padding: 2px 7px !important; cursor: pointer !important;
+      border: 1px solid var(--ov-border) !important; border-radius: var(--ov-r) !important;
+      padding: 3px 9px !important; flex-shrink: 0 !important;
       font-family: inherit !important; font-size: calc(10px * var(--ov-font-scale,1)) !important;
+      transition: color 90ms, border-color 90ms, background 90ms !important;
     }
-    #ov-panel .ov-sm-act:hover { color: var(--ov-accent) !important; border-color: var(--ov-accent) !important; }
+    #ov-panel .ov-sm-act:hover { color: var(--ov-accent-soft) !important; border-color: var(--ov-accent-bd) !important; background: var(--ov-accent-bg) !important; }
+    #ov-panel .ov-sm-act-stop {
+      color: var(--ov-s-err) !important;
+      background: rgba(229,97,94,.10) !important;
+      border-color: rgba(229,97,94,.3) !important;
+    }
+    #ov-panel .ov-sm-act-stop:hover { color: var(--ov-s-err) !important; background: rgba(229,97,94,.18) !important; border-color: var(--ov-s-err) !important; }
+
+    /* ── Build progress ── */
     #ov-panel .ov-sm-status {
-      padding: 5px 10px !important; color: var(--ov-accent) !important;
-      font-size: calc(10px * var(--ov-font-scale,1)) !important;
-      border-bottom: 1px solid var(--ov-grid) !important;
+      padding: 8px 12px !important;
+      border-bottom: 1px solid var(--ov-border-soft) !important;
+      background: var(--ov-bg-2) !important;
     }
+    #ov-panel .ov-sm-status-line {
+      display: flex !important; align-items: center !important; gap: 8px !important;
+      font-size: calc(10.5px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-text-dim) !important;
+    }
+    #ov-panel .ov-sm-spin {
+      width: 11px !important; height: 11px !important; flex-shrink: 0 !important;
+      border: 2px solid var(--ov-border) !important;
+      border-top-color: var(--ov-accent) !important;
+      border-radius: 50% !important; display: inline-block !important;
+      animation: ov-spin .7s linear infinite !important;
+    }
+    #ov-panel .ov-sm-track {
+      height: 5px !important; margin-top: 8px !important;
+      border-radius: 3px !important; overflow: hidden !important;
+      background: var(--ov-bg-3) !important;
+    }
+    #ov-panel .ov-sm-fill {
+      height: 100% !important;
+      background: linear-gradient(90deg, var(--ov-accent), var(--ov-trace)) !important;
+      transition: width 200ms ease !important;
+    }
+
+    /* ── Tier legend ── */
+    #ov-panel .ov-sm-legend {
+      display: flex !important; align-items: center !important; gap: 12px !important;
+      padding: 7px 12px !important;
+      border-bottom: 1px solid var(--ov-border-soft) !important;
+      background: var(--ov-bg) !important;
+      font-size: calc(9.5px * var(--ov-font-scale,1)) !important;
+      flex-wrap: wrap !important;
+    }
+    #ov-panel .ov-sm-tier { display: inline-flex !important; align-items: center !important; gap: 6px !important; }
+    #ov-panel .ov-sm-tier b { font-weight: 700 !important; }
+    /* One swatch definition, shared by the legend and the endpoint rows, so the
+       key and the thing it explains are literally the same mark. */
+    #ov-panel .ov-sm-sw {
+      width: 8px !important; height: 8px !important; border-radius: 2px !important;
+      display: inline-block !important; flex-shrink: 0 !important;
+      box-sizing: border-box !important;
+    }
+    #ov-panel .ov-sm-sw-observed { background: var(--ov-s-2xx) !important; }
+    #ov-panel .ov-sm-sw-declared { background: var(--ov-s-3xx) !important; }
+    /* Inferred is dashed everywhere it appears — the shape says "candidate". */
+    #ov-panel .ov-sm-sw-inferred { background: transparent !important; border: 1px dashed var(--ov-s-4xx) !important; }
+    #ov-panel .ov-sm-legend .ov-tier-observed { color: var(--ov-s-2xx) !important; }
+    #ov-panel .ov-sm-legend .ov-tier-declared { color: var(--ov-s-3xx) !important; }
+    #ov-panel .ov-sm-legend .ov-tier-inferred { color: var(--ov-s-4xx) !important; }
+    #ov-panel .ov-sm-legend-note { color: var(--ov-text-ghost) !important; }
+
+    /* ── Page cards ── */
+    #ov-panel .ov-sm-page { padding: 0 8px !important; }
+    #ov-panel .ov-sm-page:first-of-type { padding-top: 8px !important; }
     #ov-panel .ov-sm-phead {
-      display: flex !important; align-items: center !important; gap: 6px !important;
-      padding: 5px 10px !important; cursor: pointer !important;
-      border-bottom: 1px solid var(--ov-grid) !important; background: var(--ov-bg-2) !important;
+      display: flex !important; align-items: center !important; gap: 8px !important;
+      padding: 6px 10px !important; cursor: pointer !important;
+      border-radius: var(--ov-r) !important;
+      background: var(--ov-bg-2) !important;
+      margin-bottom: 4px !important;
       font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      transition: background 90ms !important;
     }
     #ov-panel .ov-sm-phead:hover { background: var(--ov-bg-3) !important; }
-    #ov-panel .ov-sm-sitewide .ov-sm-phead { background: var(--ov-bg-3) !important; }
+    #ov-panel .ov-sm-sitewide .ov-sm-phead {
+      background: transparent !important;
+      border: 1px solid var(--ov-border-soft) !important;
+    }
     #ov-panel .ov-sm-caret { color: var(--ov-text-faint) !important; width: 9px !important; flex-shrink: 0 !important; }
-    #ov-panel .ov-sm-route { color: var(--ov-text) !important; overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important; }
+    #ov-panel .ov-sm-route {
+      color: var(--ov-title) !important; font-weight: 600 !important;
+      overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important;
+    }
+
+    /* Tier badges are pills, and the inferred one is outlined rather than filled. */
     #ov-panel .ov-sm-badge {
-      color: var(--ov-text-muted) !important; border: 1px solid var(--ov-border) !important;
-      border-radius: 2px !important; padding: 0 4px !important; flex-shrink: 0 !important;
+      color: var(--ov-text-faint) !important;
+      background: var(--ov-bg-3) !important;
+      border: 1px solid transparent !important;
+      border-radius: 20px !important; padding: 1px 8px !important; flex-shrink: 0 !important;
       font-size: calc(9px * var(--ov-font-scale,1)) !important;
     }
-    #ov-panel .ov-sm-badge-obs { color: var(--ov-s-pending) !important; border-color: var(--ov-s-pending) !important; }
-    #ov-panel .ov-sm-badge-inf { color: var(--ov-text-faint) !important; }
-    #ov-panel .ov-sm-err { color: var(--ov-s-4xx) !important; font-size: calc(9px * var(--ov-font-scale,1)) !important; }
-    #ov-panel .ov-sm-n { color: var(--ov-text-muted) !important; font-size: calc(9px * var(--ov-font-scale,1)) !important; flex-shrink: 0 !important; }
+    #ov-panel .ov-sm-badge-obs {
+      color: var(--ov-s-2xx) !important;
+      background: rgba(78,201,165,.12) !important;
+      border-color: rgba(78,201,165,.3) !important;
+    }
+    #ov-panel .ov-sm-badge-inf {
+      color: var(--ov-s-4xx) !important;
+      background: rgba(217,164,65,.10) !important;
+      border: 1px dashed rgba(217,164,65,.45) !important;
+    }
+    #ov-panel .ov-sm-err {
+      color: var(--ov-s-4xx) !important; font-size: calc(9px * var(--ov-font-scale,1)) !important;
+      overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important;
+    }
+    #ov-panel .ov-sm-n { color: var(--ov-text-faint) !important; font-size: calc(9.5px * var(--ov-font-scale,1)) !important; flex-shrink: 0 !important; }
     #ov-panel .ov-sm-scan {
-      background: transparent !important; color: var(--ov-accent) !important;
-      border: 1px solid var(--ov-border) !important; border-radius: 2px !important;
-      padding: 0 6px !important; cursor: pointer !important; flex-shrink: 0 !important;
+      all: unset !important;
+      cursor: pointer !important;
+      background: var(--ov-accent-bg) !important; color: var(--ov-accent-soft) !important;
+      border: 1px solid var(--ov-accent-bd) !important; border-radius: var(--ov-r) !important;
+      padding: 2px 9px !important; flex-shrink: 0 !important;
       font-family: inherit !important; font-size: calc(9px * var(--ov-font-scale,1)) !important;
     }
-    #ov-panel .ov-sm-scan:hover:not(:disabled) { background: var(--ov-accent-bg) !important; }
+    #ov-panel .ov-sm-scan:hover:not(:disabled) { background: rgba(91,140,255,.24) !important; }
     #ov-panel .ov-sm-scan:disabled { opacity: .4 !important; cursor: default !important; }
+    #ov-panel .ov-sm-shield {
+      color: var(--ov-s-err) !important;
+      background: rgba(229,97,94,.08) !important;
+      border: 1px solid rgba(229,97,94,.25) !important;
+      border-radius: var(--ov-r) !important;
+      padding: 2px 8px !important; flex-shrink: 0 !important; white-space: nowrap !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
+    }
+
+    /* ── Endpoint rows ── */
     #ov-panel .ov-sm-ep {
       display: flex !important; align-items: center !important; gap: 7px !important;
-      padding: 3px 10px 3px 26px !important; cursor: pointer !important;
-      border-bottom: 1px solid var(--ov-grid) !important;
-      font-size: calc(11px * var(--ov-font-scale,1)) !important;
+      padding: 3px 10px 3px 22px !important; cursor: pointer !important;
+      margin: 0 0 1px 12px !important;
+      border-radius: var(--ov-r-sm) !important;
+      font-size: calc(10.5px * var(--ov-font-scale,1)) !important;
     }
     #ov-panel .ov-sm-ep:hover { background: var(--ov-bg-2) !important; }
-    #ov-panel .ov-sm-m { width: 44px !important; flex-shrink: 0 !important; font-weight: 600 !important; }
-    #ov-panel .ov-sm-m-unk { color: var(--ov-text-faint) !important; }
+    #ov-panel .ov-sm-m { width: 40px !important; flex-shrink: 0 !important; font-weight: 600 !important; font-size: calc(9.5px * var(--ov-font-scale,1)) !important; }
+    #ov-panel .ov-sm-m-unk { color: var(--ov-text-ghost) !important; }
     #ov-panel .ov-sm-url { flex: 1 1 auto !important; overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important; color: var(--ov-text-dim) !important; }
-    #ov-panel .ov-sm-zap { flex-shrink: 0 !important; font-size: calc(9px * var(--ov-font-scale,1)) !important; }
-    #ov-panel .ov-sm-st { flex-shrink: 0 !important; font-size: calc(9px * var(--ov-font-scale,1)) !important; }
-    #ov-panel .ov-sm-ms { flex-shrink: 0 !important; color: var(--ov-text-faint) !important; font-size: calc(9px * var(--ov-font-scale,1)) !important; min-width: 34px !important; text-align: right !important; }
-    /* Inferred rows are guesses — dim them and mark the left edge so they never
-       read as measured data. */
-    #ov-panel .ov-tier-inferred { opacity: .68 !important; border-left: 2px solid var(--ov-text-faint) !important; }
-    #ov-panel .ov-tier-declared { border-left: 2px solid var(--ov-m-put) !important; }
-    #ov-panel .ov-tier-observed { border-left: 2px solid var(--ov-s-pending) !important; }
-    #ov-panel .ov-sm-legend .ov-tier-observed { border: 0 !important; color: var(--ov-s-pending) !important; }
-    #ov-panel .ov-sm-legend .ov-tier-declared { border: 0 !important; color: var(--ov-m-put) !important; }
-    #ov-panel .ov-sm-legend .ov-tier-inferred { border: 0 !important; color: var(--ov-text-faint) !important; opacity: 1 !important; }
+    #ov-panel .ov-sm-zap { flex-shrink: 0 !important; font-size: calc(9px * var(--ov-font-scale,1)) !important; color: var(--ov-trace) !important; }
+    #ov-panel .ov-sm-st { flex-shrink: 0 !important; font-size: calc(9px * var(--ov-font-scale,1)) !important; font-weight: 600 !important; }
+    #ov-panel .ov-sm-ms { flex-shrink: 0 !important; color: var(--ov-text-ghost) !important; font-size: calc(9px * var(--ov-font-scale,1)) !important; min-width: 34px !important; text-align: right !important; }
+
+    /* Tier is carried by the same swatch the legend uses, sitting with the other
+       trailing metadata. A left rail here reads as a stray bracket, because the
+       row is rounded and the mark is only as tall as one line of text. */
+    #ov-panel .ov-sm-ep.ov-tier-inferred { opacity: .72 !important; }
+    #ov-panel .ov-sm-ep.ov-tier-inferred .ov-sm-url { font-style: italic !important; }
+
+    /* ── Third-party group ── */
     #ov-panel .ov-sm-tp {
-      display: flex !important; align-items: center !important; gap: 6px !important;
-      padding: 3px 10px 3px 20px !important; cursor: pointer !important;
-      border-bottom: 1px solid var(--ov-grid) !important; color: var(--ov-text-muted) !important;
+      display: flex !important; align-items: center !important; gap: 7px !important;
+      padding: 4px 10px !important; cursor: pointer !important;
+      margin: 2px 0 3px 12px !important;
+      border: 1px solid var(--ov-border-soft) !important;
+      border-radius: var(--ov-r) !important;
+      color: var(--ov-text-muted) !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
     }
     #ov-panel .ov-sm-tp:hover { background: var(--ov-bg-2) !important; }
     #ov-panel .ov-sm-tp-host { overflow: hidden !important; text-overflow: ellipsis !important; white-space: nowrap !important; }
-    #ov-panel .ov-sm-tp-tag { color: var(--ov-text-faint) !important; font-size: calc(9px * var(--ov-font-scale,1)) !important; }
-    #ov-panel .ov-sm-none { padding: 6px 26px !important; color: var(--ov-text-faint) !important; font-size: calc(10px * var(--ov-font-scale,1)) !important; }
+    #ov-panel .ov-sm-tp-tag { color: var(--ov-text-ghost) !important; font-size: calc(9px * var(--ov-font-scale,1)) !important; }
+    #ov-panel .ov-sm-none {
+      padding: 6px 10px 8px 24px !important; color: var(--ov-text-ghost) !important;
+      font-style: italic !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
+    }
   `;
 }

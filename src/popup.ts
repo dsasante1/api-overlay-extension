@@ -69,6 +69,7 @@ const btnToggle     = document.getElementById('btn-toggle') as HTMLButtonElement
 const btnPause      = document.getElementById('btn-pause') as HTMLButtonElement;
 const btnExport     = document.getElementById('btn-export') as HTMLButtonElement;
 const btnClear      = document.getElementById('btn-clear') as HTMLButtonElement;
+const btnDisable    = document.getElementById('btn-disable') as HTMLButtonElement;
 const btnDark       = document.getElementById('btn-dark') as HTMLButtonElement;
 const btnLight      = document.getElementById('btn-light') as HTMLButtonElement;
 const fontBtns: Record<PopupFontFamilyKey, HTMLButtonElement> = {
@@ -76,15 +77,13 @@ const fontBtns: Record<PopupFontFamilyKey, HTMLButtonElement> = {
   sans:  document.getElementById('btn-font-sans')  as HTMLButtonElement,
   serif: document.getElementById('btn-font-serif') as HTMLButtonElement,
 };
-const sizeBtns: Record<PopupFontSizeKey, HTMLButtonElement> = {
-  s:  document.getElementById('btn-size-s')  as HTMLButtonElement,
-  m:  document.getElementById('btn-size-m')  as HTMLButtonElement,
-  l:  document.getElementById('btn-size-l')  as HTMLButtonElement,
-  xl: document.getElementById('btn-size-xl') as HTMLButtonElement,
-};
+// Font size is a slider: four discrete steps, ordered smallest to largest.
+const SIZE_STEPS: PopupFontSizeKey[] = ['s', 'm', 'l', 'xl'];
+const sizeRange = document.getElementById('size-range') as HTMLInputElement;
 const hostInput     = document.getElementById('host-input') as HTMLInputElement;
 const btnAddHost    = document.getElementById('btn-add-host') as HTMLButtonElement;
 const siteCountEl   = document.getElementById('site-count') as HTMLElement;
+const versionEl     = document.getElementById('ext-version') as HTMLElement;
 const footerPm      = document.getElementById('footer-pm') as HTMLElement;
 const footerStatus  = document.getElementById('footer-status') as HTMLElement;
 
@@ -104,10 +103,8 @@ function applyPopupFontFamily(family: PopupFontFamilyKey): void {
 }
 
 function applyPopupFontSize(size: PopupFontSizeKey): void {
-  const valid = size in sizeBtns ? size : 'm';
-  for (const key of Object.keys(sizeBtns) as PopupFontSizeKey[]) {
-    sizeBtns[key].className = `btn${key === valid ? ' primary' : ''}`;
-  }
+  const idx = SIZE_STEPS.indexOf(size);
+  sizeRange.value = String(idx === -1 ? SIZE_STEPS.indexOf('m') : idx);
 }
 
 function applyVisibleState(v: boolean): void {
@@ -132,11 +129,9 @@ function updateCurrentSiteSection(): void {
   // hostname + meta
   statusHost.textContent = currentHostname || '—';
   if (isActive) {
-    statusMeta.textContent = requestCount > 0 ? `${requestCount} req` : '';
-    statusMeta.style.color = 'var(--accent)';
+    statusMeta.textContent = requestCount > 0 ? `active · ${requestCount} captured` : 'active';
   } else {
-    statusMeta.textContent = currentHostname ? 'add to enable' : '';
-    statusMeta.style.color = '';
+    statusMeta.textContent = currentHostname ? 'dormant here' : '';
   }
 
   // buttons
@@ -158,17 +153,17 @@ function renderHostList(): void {
   const list = document.getElementById('host-list') as HTMLElement;
   siteCountEl.textContent = String(allowedHosts.length);
   if (allowedHosts.length === 0) {
-    list.innerHTML = '<div class="host-empty">no sites yet — add one above</div>';
+    list.innerHTML = '<div class="host-empty">Nothing allowed yet.<br>CalloutAPI stays dormant until you add a host.</div>';
     return;
   }
   list.innerHTML = allowedHosts.map((h, i) => {
     const safe = popupEscHtml(h);
     const isCurrent = currentHostname === h || currentHostname.endsWith(`.${h}`);
-    const nowBadge = isCurrent ? '<span class="host-now">● now</span>' : '';
     return `<div class="host-item${isCurrent ? ' current' : ''}">
+      <span class="host-dot">${isCurrent ? '●' : '○'}</span>
       <span class="host-name" title="${safe}">${safe}</span>
-      ${nowBadge}
-      <button class="host-remove" data-index="${i}" title="Remove">×</button>
+      <span class="host-meta">+ subdomains</span>
+      <button type="button" class="host-remove" data-index="${i}" title="Remove">✕</button>
     </div>`;
   }).join('');
 }
@@ -195,6 +190,10 @@ function bindHostListDelegation(): void {
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init(): Promise<void> {
+  // Read from the manifest rather than hard-coding it here, so the two can
+  // never disagree after a version bump.
+  versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
+
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   currentTabId = tab?.id ?? null;
   try { currentHostname = tab?.url ? new URL(tab.url).hostname : ''; } catch { currentHostname = ''; }
@@ -266,12 +265,11 @@ for (const key of Object.keys(fontBtns) as PopupFontFamilyKey[]) {
   });
 }
 
-for (const key of Object.keys(sizeBtns) as PopupFontSizeKey[]) {
-  sizeBtns[key].addEventListener('click', async () => {
-    applyPopupFontSize(key);
-    await send('font-size', { value: key });
-  });
-}
+sizeRange.addEventListener('input', async () => {
+  const key = SIZE_STEPS[Number(sizeRange.value)];
+  if (!key) return;
+  await send('font-size', { value: key });
+});
 
 btnToggle.addEventListener('click', async () => {
   const prev = visible;
@@ -308,6 +306,23 @@ btnEnable.addEventListener('click', async () => {
   siteEnabled = true;
   updateCurrentSiteSection();
   if (currentTabId != null) await sendMessageSafe(currentTabId, { action: 'activate' });
+});
+
+// Drop every allowlist rule that covers this hostname — an exact entry, and any
+// parent domain the host inherits from — then tear the overlay down in place.
+btnDisable.addEventListener('click', async () => {
+  if (!currentHostname) return;
+  const remaining = allowedHosts.filter(
+    h => !(currentHostname === h || currentHostname.endsWith(`.${h}`)),
+  );
+  if (remaining.length !== allowedHosts.length) {
+    allowedHosts = remaining;
+    await chrome.storage.local.set({ ovAllowedHosts: allowedHosts });
+    renderHostList();
+  }
+  siteEnabled = false;
+  updateCurrentSiteSection();
+  if (currentTabId != null) await sendMessageSafe(currentTabId, { action: 'deactivate' });
 });
 
 btnAddHost.addEventListener('click', async () => {
