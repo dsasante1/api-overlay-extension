@@ -161,6 +161,23 @@ describe('docked inspector', () => {
     expect(trigger.dataset.sel).toBe('%23buy')
   })
 
+  it('reports only measured timings, never a fabricated phase breakdown', () => {
+    seed(req({ id: 1, ms: 88, kind: 'fetch' }))
+    openRow(1)
+    const timingTab = [...document.querySelectorAll<HTMLElement>('.ov-tab')]
+      .find(t => t.dataset.tab === 'timing')!
+    timingTab.click()
+    ov.renderList()
+
+    const pane = document.querySelector('#ov-dock .ov-panel')!
+    expect(pane.textContent).toContain('88ms')
+    // DNS / TCP / download cannot be seen from the page, so they must not appear
+    // at all — a plausible-looking constant is worse than an absent row.
+    for (const phase of ['DNS', 'TCP', 'TTFB', 'Download']) {
+      expect(pane.textContent, phase).not.toContain(phase)
+    }
+  })
+
   it('marks a background request as unattributed', () => {
     seed(req({ id: 1, element: null }))
     openRow(1)

@@ -48,9 +48,6 @@ interface OverlayMessage extends Partial<ApiRequest> {
 }
 
 
-const TIMING_DNS_MS = 12;
-const TIMING_TCP_MS = 28;
-const TIMING_DL_MS  = 20;
 
 const MAX_REQUESTS = 1000;
 const MAX_WS_MESSAGES_PER_CONN = 500;
@@ -1521,23 +1518,19 @@ function headersPaneHtml(req: ApiRequest): string {
     </div>`;
 }
 
-// Only the total is measured. The breakdown is drawn muted and captioned so it
-// can never be mistaken for real DNS / TCP / download numbers.
+// Everything here is measured. The hook times the call from the page's own
+// context, so start-to-finish is all it can see — there is no DNS/TCP/TTFB
+// breakdown to show, and inventing one would be worse than omitting it.
 function timingPaneHtml(req: ApiRequest): string {
-  const total = req.ms ?? 0;
-  const ttfb = Math.max(0, total - TIMING_DNS_MS - TIMING_TCP_MS - TIMING_DL_MS);
   const pending = req.status === 'pending';
+  const started = req.ts ? new Date(req.ts).toLocaleTimeString(undefined, { hour12: false }) : '—';
   return `<div class="ov-panel">
     <div class="ov-kv">
-      <div class="ov-kv-k">Total</div><div class="ov-kv-v">${pending ? 'measuring…' : total + 'ms'}</div>
+      <div class="ov-kv-k">Duration</div><div class="ov-kv-v">${pending ? 'measuring…' : formatDuration(req.ms)}</div>
+      <div class="ov-kv-k">Started</div><div class="ov-kv-v">${escHtml(started)}</div>
+      <div class="ov-kv-k">Kind</div><div class="ov-kv-v">${escHtml(req.kind ?? 'fetch')}</div>
     </div>
-    <div class="ov-kv ov-kv-est">
-      <div class="ov-kv-k">DNS</div><div class="ov-kv-v">${TIMING_DNS_MS}ms</div>
-      <div class="ov-kv-k">TCP</div><div class="ov-kv-v">${TIMING_TCP_MS}ms</div>
-      <div class="ov-kv-k">TTFB</div><div class="ov-kv-v">${ttfb}ms</div>
-      <div class="ov-kv-k">Download</div><div class="ov-kv-v">${TIMING_DL_MS}ms</div>
-    </div>
-    <div class="ov-timing-note"><span>⚠</span><span>Only <b>total duration</b> is measured. DNS / TCP / download are placeholder constants, shown muted so they never read as real timings.</span></div>
+    <div class="ov-kv-note">Measured from the page, so this is the whole round trip. A per-phase breakdown would need the browser's Resource Timing data, which this build does not read.</div>
   </div>`;
 }
 
@@ -1955,9 +1948,8 @@ function detailTabText(req: ApiRequest, tab: DetailTab): string {
       return `-- Request --\n${fmt(req.reqHeaders)}\n\n-- Response --\n${fmt(req.resHeaders)}`;
     }
     case 'timing': {
-      const total = req.ms ?? 0;
-      const ttfb = Math.max(0, total - TIMING_DNS_MS - TIMING_TCP_MS - TIMING_DL_MS);
-      return `DNS: ${TIMING_DNS_MS}ms\nTCP: ${TIMING_TCP_MS}ms\nTTFB: ${ttfb}ms\nDownload: ${TIMING_DL_MS}ms\nTotal: ${total}ms`;
+      const started = req.ts ? new Date(req.ts).toISOString() : '—';
+      return `Duration: ${formatDuration(req.ms)}\nStarted: ${started}\nKind: ${req.kind ?? 'fetch'}`;
     }
     case 'frames':
       return (req.messages ?? []).slice(-100).map(m => `[${m.dir} +${m.ts}ms] ${m.body}`).join('\n');
@@ -3811,19 +3803,13 @@ function injectStyles(): void {
       padding: 2px 0 !important;
     }
     .ov-kv-v { color: var(--ov-text) !important; font-weight: 600 !important; padding: 2px 0 !important; }
-    .ov-kv-est .ov-kv-k, .ov-kv-est .ov-kv-v { color: var(--ov-text-ghost) !important; font-weight: 400 !important; }
-    .ov-timing-note {
-      display: flex !important;
-      gap: 8px !important;
-      align-items: flex-start !important;
+    /* Explains an absence rather than warning about bad data, so it is set as
+       quiet body text, not as a caution. */
+    .ov-kv-note {
       margin-top: 12px !important;
-      padding: 8px 10px !important;
-      border-radius: var(--ov-r) !important;
-      background: rgba(217,164,65,.08) !important;
-      border: 1px solid rgba(217,164,65,.28) !important;
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
-      color: var(--ov-s-4xx) !important;
-      line-height: 1.5 !important;
+      color: var(--ov-text-ghost) !important;
+      line-height: 1.55 !important;
       font-family: var(--ov-font-family,'IBM Plex Sans',system-ui,sans-serif) !important;
     }
 
