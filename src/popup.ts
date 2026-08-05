@@ -83,6 +83,7 @@ const sizeRange = document.getElementById('size-range') as HTMLInputElement;
 const hostInput     = document.getElementById('host-input') as HTMLInputElement;
 const btnAddHost    = document.getElementById('btn-add-host') as HTMLButtonElement;
 const siteCountEl   = document.getElementById('site-count') as HTMLElement;
+const versionEl     = document.getElementById('ext-version') as HTMLElement;
 const footerPm      = document.getElementById('footer-pm') as HTMLElement;
 const footerStatus  = document.getElementById('footer-status') as HTMLElement;
 
@@ -189,6 +190,10 @@ function bindHostListDelegation(): void {
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init(): Promise<void> {
+  // Read from the manifest rather than hard-coding it here, so the two can
+  // never disagree after a version bump.
+  versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
+
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   currentTabId = tab?.id ?? null;
   try { currentHostname = tab?.url ? new URL(tab.url).hostname : ''; } catch { currentHostname = ''; }
