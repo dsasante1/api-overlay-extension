@@ -3114,6 +3114,9 @@ function injectStyles(): void {
       text-transform: uppercase !important;
       flex-shrink: 0 !important;
     }
+    /* Pushes #ov-actions to the trailing edge, so the controls track the panel's
+       width instead of bunching against the live badge on a wide panel. */
+    .ov-hdr-spacer { flex: 1 !important; min-width: 0 !important; }
     .ov-live {
       display: inline-flex !important;
       align-items: center !important;
