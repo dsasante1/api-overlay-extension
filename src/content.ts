@@ -2378,6 +2378,16 @@ function buildPanel(): void {
   filterInput.oninput = () => scheduleRender();
   if (ovExport) ovExport.onclick = exportHAR;
 
+  // The field's padding and the '›' prompt belong to the wrapper, not the input,
+  // so clicking them would otherwise do nothing despite showing a text cursor.
+  const field = filterInput;
+  $('ov-search')?.addEventListener('mousedown', (e) => {
+    const t = e.target as Element;
+    if (t === field || t.closest('button')) return;
+    e.preventDefault();
+    field.focus();
+  });
+
   if (caseBtn) caseBtn.onclick = () => {
     caseSensitiveSearch = !caseSensitiveSearch;
     caseBtn.classList.toggle('ov-active', caseSensitiveSearch);
@@ -2886,7 +2896,9 @@ function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
   handle.addEventListener('mousedown', (e: MouseEvent) => {
     // Form controls live in the header rows, and the preventDefault() below would
     // stop them ever taking focus — you could not click into the search box.
-    if ((e.target as Element).closest('button, input, textarea, select, [contenteditable]')) return;
+    // .ov-search covers the field's own padding too: it shows a text cursor, so
+    // grabbing it must land in the input rather than drag the panel away.
+    if ((e.target as Element).closest('button, input, textarea, select, [contenteditable], .ov-search')) return;
     e.preventDefault();
     const rect0 = panel.getBoundingClientRect();
     ox = e.clientX - rect0.left;
@@ -3208,6 +3220,9 @@ function injectStyles(): void {
       border: 1px solid var(--ov-border) !important;
       border-radius: var(--ov-r) !important;
       padding: 0 7px 0 9px !important;
+      /* The toolbar is a drag handle, so it hands down cursor:move. The field has
+         to look typeable across its whole box, padding and prompt included. */
+      cursor: text !important;
     }
     .ov-search:focus-within { border-color: var(--ov-accent-bd) !important; }
     .ov-prompt {
@@ -3222,6 +3237,11 @@ function injectStyles(): void {
       color: var(--ov-text) !important;
       font-size: calc(11px * var(--ov-font-scale,1)) !important;
       font-family: inherit !important;
+      /* all:unset drops the UA's own cursor and user-select, leaving the input to
+         inherit the drag handle's move cursor and its unselectable text. */
+      cursor: text !important;
+      user-select: text !important;
+      -webkit-user-select: text !important;
     }
     #ov-filter::placeholder { color: var(--ov-text-ghost) !important; }
     #ov-filter.ov-filter-invalid { color: var(--ov-s-err) !important; }
