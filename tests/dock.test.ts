@@ -405,3 +405,63 @@ describe('refreshClusterBadge', () => {
     expect(badge.querySelector('.ov-fb-popup')?.classList.contains('ov-fb-popup-show')).toBe(true)
   })
 })
+
+describe('click-away dismissal', () => {
+  /** A full press on `el`: the capture-phase pair the dismissal path listens for. */
+  const clickOn = (el: Element) => {
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  }
+
+  const pageButton = () => {
+    document.body.innerHTML = '<button id="page-btn">go</button>'
+    return document.getElementById('page-btn')!
+  }
+
+  it('collapses the panel to the pill when the page is clicked', () => {
+    clickOn(pageButton())
+    expect(pill()).not.toBeNull()
+    expect(panel()?.style.display).toBe('none')
+  })
+
+  it('leaves the panel open when the click lands inside it', () => {
+    clickOn(document.getElementById('ov-list')!)
+    expect(pill()).toBeNull()
+    expect(panel()?.style.display).not.toBe('none')
+  })
+
+  it('leaves the panel open when the click lands on an endpoint badge', () => {
+    // Badge rows navigate into the panel, so a press there is not a click-away.
+    const badge = document.createElement('div')
+    badge.className = 'ov-float-badge'
+    badge.innerHTML = '<div class="ov-fb-row" data-id="1"></div>'
+    document.documentElement.appendChild(badge)
+
+    clickOn(badge.querySelector('.ov-fb-row')!)
+    expect(pill()).toBeNull()
+    expect(panel()?.style.display).not.toBe('none')
+  })
+
+  it('ignores a drag that began inside the panel and ended on the page', () => {
+    // Selecting response text past the panel edge lands its click on the page.
+    const btn = pageButton()
+    panel()!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    btn.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    expect(pill()).toBeNull()
+  })
+
+  it('does not re-arm from a stale press once the drag click is spent', () => {
+    const btn = pageButton()
+    panel()!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    btn.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    clickOn(btn)
+    expect(pill()).not.toBeNull()
+  })
+
+  it('is inert once collapsed', () => {
+    ov.setDockState('pill')
+    clickOn(pageButton())
+    expect(pill()).not.toBeNull()
+    expect(panel()?.style.display).toBe('none')
+  })
+})
