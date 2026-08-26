@@ -23,8 +23,8 @@ questions DevTools answers poorly:
 **Users:** frontend and full-stack developers, QA engineers, API integrators, and technical
 users reverse-engineering an application's backend.
 
-**Character:** a developer inspection tool. Dense with information, precise, safe to show on
-a screen share (credentials are redacted before they are ever displayed).
+**Character:** a developer inspection tool. Dense with information, precise, and faithful to
+what the page actually sent — headers and bodies are shown verbatim, as DevTools does.
 
 ---
 
@@ -139,14 +139,12 @@ Captured requests are mirrored to the extension's service worker and survive in-
 navigations — login redirects, logout flows and multi-step journeys keep their history
 instead of resetting. History is discarded only when the user clears it or the tab closes.
 
-### 2.12 Privacy and redaction
-Because the tool is meant to be usable on a screen share, sensitive data is scrubbed at
-capture time, before it is ever stored or displayed:
-
-- Credential headers (`authorization`, `proxy-authorization`, `cookie`, `set-cookie`,
-  `x-api-key`, `x-auth-token`, `x-csrf-token`).
-- Sensitive JSON body keys (passwords, tokens, secrets, private keys, API keys, session
-  identifiers).
+### 2.12 Fidelity
+Headers and bodies are captured and displayed exactly as the page sent or received them,
+with no scrubbing. The same values are already visible in the browser's own console and
+Network tab, so masking them bought no privacy while breaking debugging of auth and
+session problems — the cases the tool is most often reached for. Treat a capture (and an
+exported HAR) as containing live credentials.
 
 ### 2.13 Appearance preferences
 User-selectable and persisted across sessions:
@@ -176,8 +174,8 @@ What the design has to find room for.
 | Initiator | The triggering element (with a human-readable label), or background |
 | Request body | Absent, text, or JSON |
 | Response body | Absent, text, or JSON — can be multiple megabytes |
-| Request headers | Key/value pairs, some redacted |
-| Response headers | Key/value pairs, some redacted |
+| Request headers | Key/value pairs, verbatim |
+| Response headers | Key/value pairs, verbatim |
 | WebSocket frames | Direction, timestamp and payload per frame |
 | Timing breakdown | ⚠️ Only total duration is real; the DNS/TCP/download components are placeholder constants, and any visualization should not imply otherwise |
 | Page URL | The page or SPA route that was active when the call fired |
@@ -248,7 +246,7 @@ dependencies · build is a plain `tsc` compile.
 
 | File | Role |
 |---|---|
-| `src/injected.ts` | Page-world hook: patches `fetch` / `XHR` / `WebSocket`, redacts, emits events |
+| `src/injected.ts` | Page-world hook: patches `fetch` / `XHR` / `WebSocket`, emits events |
 | `src/content.ts` | The overlay: capture handling, rendering, highlighting, JSON virtualization, HAR export |
 | `src/sitemap.ts` | Site-map model, discovery, static analysis, rendering, Markdown export |
 | `src/background.ts` | Service worker: per-tab log persistence and background page scanning |

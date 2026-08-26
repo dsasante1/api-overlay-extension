@@ -160,6 +160,11 @@ let currentView: OverlayView = 'log';
 let ghostHeld = false;
 let ghostTimer: number | null = null;
 let clusterOutsideClickHandler: ((e: MouseEvent) => void) | null = null;
+let dismissPressHandler: ((e: MouseEvent) => void) | null = null;
+let dismissClickHandler: ((e: MouseEvent) => void) | null = null;
+// Whether the press in flight began on overlay UI. A drag that starts inside the
+// panel (selecting response text, resizing) must not read as a click-away.
+let pressStartedOnOverlay = false;
 
 let valueHighlightEls: HTMLElement[] = [];
 let valueHighlightIndex = 0;
@@ -2215,6 +2220,32 @@ function setDockState(next: DockState): void {
   }
 }
 
+// ── Click-away dismissal ──────────────────────────────────────────────────────
+
+// Overlay surfaces a click can land on without meaning "get out of the way": the
+// panel, the pill, an endpoint badge (circle or popup row) and the value cycler.
+const OVERLAY_UI_SELECTOR = '#ov-panel, #ov-pill, .ov-float-badge, #ov-value-cycler';
+
+function isOverlayUi(el: EventTarget | null): boolean {
+  return el instanceof Element && !!el.closest(OVERLAY_UI_SELECTOR);
+}
+
+function onDismissPress(e: MouseEvent): void {
+  pressStartedOnOverlay = isOverlayUi(e.target);
+}
+
+// Clicking the page collapses the panel back to the pill, so the overlay steps
+// aside the moment attention returns to the site. Badges are excluded: their
+// rows navigate into the panel (navigateToRequest), which re-expands it.
+function onDismissClick(e: MouseEvent): void {
+  const fromOverlay = pressStartedOnOverlay;
+  pressStartedOnOverlay = false;          // one press, one verdict
+  if (dockState !== 'panel' || !panelVisible) return;
+  if (fromOverlay) return;                // drag that began inside the panel
+  if (isOverlayUi(e.target)) return;
+  setDockState('pill');
+}
+
 // Colour class for one tick in the pill's recent-request rail.
 function pillTickClass(r: ApiRequest): string {
   const b = statusBucket(r);
@@ -2683,7 +2714,7 @@ function reattachRevHighlight(): void {
 }
 
 function isOverlayOwned(el: Element | null): boolean {
-  return !!el && (!!el.closest('#ov-panel') || !!el.closest('#ov-pill') || el.classList.contains('ov-float-badge'));
+  return isOverlayUi(el);
 }
 
 // Resolve every captured selector to its live element once, keyed by element so
@@ -4455,6 +4486,12 @@ function activateOverlay(): void {
   };
   document.addEventListener('click', clusterOutsideClickHandler, true);
 
+  // Capture phase so a page that swallows its own clicks can't pin the panel open.
+  dismissPressHandler = onDismissPress;
+  dismissClickHandler = onDismissClick;
+  document.addEventListener('mousedown', dismissPressHandler, true);
+  document.addEventListener('click', dismissClickHandler, true);
+
   pageHoverHandler = onPageHover;
   pageHoverOutHandler = onPageHoverOut;
   document.addEventListener('mouseover', pageHoverHandler, true);
@@ -4473,6 +4510,15 @@ function deactivateOverlay(): void {
     document.removeEventListener('click', clusterOutsideClickHandler, true);
     clusterOutsideClickHandler = null;
   }
+  if (dismissPressHandler) {
+    document.removeEventListener('mousedown', dismissPressHandler, true);
+    dismissPressHandler = null;
+  }
+  if (dismissClickHandler) {
+    document.removeEventListener('click', dismissClickHandler, true);
+    dismissClickHandler = null;
+  }
+  pressStartedOnOverlay = false;
   if (pageHoverHandler) {
     document.removeEventListener('mouseover', pageHoverHandler, true);
     pageHoverHandler = null;
