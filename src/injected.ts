@@ -45,47 +45,6 @@ interface XMLHttpRequest {
   // streaming bytes we'd only discard. Kept in lockstep with MAX_BODY_BYTES.
   const MAX_INSPECTED_BODY = MAX_BODY_BYTES;
   const INTERACT_WINDOW_MS = 800;
-  const MAX_HEADERS = 100;
-  const MAX_HEADER_VALUE = 2_000;
-  // Headers whose values are scrubbed before emitting — overlay is screen-sharable.
-  const REDACTED_HEADERS = new Set([
-    'authorization', 'proxy-authorization', 'cookie', 'set-cookie',
-    'x-api-key', 'x-auth-token', 'x-csrf-token'
-  ]);
-  // JSON body keys whose values are scrubbed for the same reason. Header redaction
-  // would leak otherwise — e.g. a login response body that contains the same token.
-  const REDACTED_BODY_KEYS = new Set([
-    'password', 'passwd', 'pwd', 'new_password', 'old_password', 'current_password',
-    'secret', 'client_secret', 'private_key', 'privatekey',
-    'token', 'access_token', 'refresh_token', 'id_token', 'auth_token', 'authtoken',
-    'api_key', 'apikey', 'authorization',
-    'jwt', 'session', 'sessionid', 'session_id'
-  ]);
-
-  function redactJsonNode(v: unknown): unknown {
-    if (Array.isArray(v)) return v.map(redactJsonNode);
-    if (v && typeof v === 'object') {
-      const out: Record<string, unknown> = {};
-      for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-        out[k] = REDACTED_BODY_KEYS.has(k.toLowerCase()) ? '[redacted]' : redactJsonNode(val);
-      }
-      return out;
-    }
-    return v;
-  }
-
-  function redactBody(text: string | null): string | null {
-    if (!text) return text;
-    const t = text.trimStart();
-    if (!t.startsWith('{') && !t.startsWith('[')) return text;
-    try {
-      const parsed = JSON.parse(text);
-      const redacted = redactJsonNode(parsed);
-      return JSON.stringify(redacted);
-    } catch {
-      return text;
-    }
-  }
 
   window.addEventListener('message', (e: MessageEvent) => {
     if (e.source !== window) return;
@@ -176,14 +135,10 @@ interface XMLHttpRequest {
     window.postMessage({ __apiOverlay: true, ...data }, TARGET_ORIGIN);
   }
 
-  function redactHeaderValue(name: string, value: string): string {
-    if (REDACTED_HEADERS.has(name.toLowerCase())) return '[redacted]';
-    return value.length > MAX_HEADER_VALUE ? value.slice(0, MAX_HEADER_VALUE) + '…' : value;
-  }
-
+  // Headers are recorded whole, every one of them — a long token or CSP is exactly
+  // what someone opens the headers pane to read. The detail pane wraps and scrolls.
   function pushHeader(out: HeaderPair[], name: string, value: unknown): void {
-    if (out.length >= MAX_HEADERS) return;
-    out.push([name, redactHeaderValue(name, String(value))]);
+    out.push([name, String(value)]);
   }
 
   function serializeHeaders(input: HeadersInit | undefined | null): HeaderPair[] | null {
@@ -301,7 +256,7 @@ interface XMLHttpRequest {
       url = String(args[0]);
       const init = args[1];
       method = (init?.method ?? 'GET').toUpperCase();
-      reqBody = redactBody(extractBody(init?.body));
+      reqBody = extractBody(init?.body);
       reqHeaders = serializeHeaders(init?.headers);
     }
     const el = getInteractedElement();
@@ -316,7 +271,7 @@ interface XMLHttpRequest {
         emit({ id, url, method, kind: 'fetch', status: res.status, ms, element: elementInfo(el), ts: t0, reqBody, reqHeaders, resHeaders });
         if (isTextLikeResponse(res)) {
           readBodyStreaming(res.clone(), MAX_BODY_BYTES).then(text => {
-            emit({ id, resBody: redactBody(text) });
+            emit({ id, resBody: text });
           }).catch(() => {});
         }
         return res;
@@ -360,7 +315,7 @@ interface XMLHttpRequest {
     const id = ++requestId;
     const method = this.__ov_method ?? 'GET';
     const url = this.__ov_url ?? '';
-    const reqBody = redactBody(extractBody(args[0] as BodyInit | Document | null));
+    const reqBody = extractBody(args[0] as BodyInit | Document | null);
     const reqHeaders = this.__ov_req_headers ? this.__ov_req_headers.slice() : null;
     const el = getInteractedElement();
     const t0 = Date.now();
@@ -378,7 +333,7 @@ interface XMLHttpRequest {
       if (!tooBig && (xhr.responseType === '' || xhr.responseType === 'text')) {
         const ct = xhr.getResponseHeader('content-type') ?? '';
         if (!ct || TEXTLIKE_CT.test(ct)) {
-          resBody = redactBody(xhr.responseText?.slice(0, MAX_BODY_BYTES) ?? null);
+          resBody = xhr.responseText?.slice(0, MAX_BODY_BYTES) ?? null;
         }
       }
       const resHeaders = parseRawHeaders(xhr.getAllResponseHeaders());
