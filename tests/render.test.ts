@@ -164,6 +164,104 @@ describe('renderFooter', () => {
     expect(ov.activeFlags.has('err')).toBe(false)
     expect(rowIds()).toEqual(['2', '1'])
   })
+
+  // An active flag on a log with zero matching rows hides everything; the button
+  // has to stay clickable or there is no way out of that state.
+  it('keeps an active flag button clickable at zero count so it can be switched off', () => {
+    ov.activeFlags.add('err')
+    seed(req({ id: 1, status: 200, ms: 10 }), req({ id: 2, status: 200, ms: 10 }))
+    expect(rowIds()).toEqual([])
+    expect(countText()).toBe('0/2')
+
+    const err = document.querySelector<HTMLButtonElement>('.ov-fstat-btn[data-f="err"]')!
+    expect(err.disabled).toBe(false)
+    expect(err.classList.contains('on')).toBe(true)
+
+    err.click()
+    expect(ov.activeFlags.has('err')).toBe(false)
+    expect(rowIds()).toEqual(['2', '1'])
+    // Off and at zero count it goes back to inert.
+    expect(document.querySelector<HTMLButtonElement>('.ov-fstat-btn[data-f="err"]')!.disabled).toBe(true)
+  })
+
+  it('does not persist the err/slow flags', () => {
+    seed(req({ id: 1, status: 500, ms: 900 }))
+    document.querySelector<HTMLButtonElement>('.ov-fstat-btn[data-f="err"]')!.click()
+    document.querySelector<HTMLButtonElement>('.ov-fstat-btn[data-f="slow"]')!.click()
+    expect(ov.activeFlags.has('err')).toBe(true)
+    expect(ov.activeFlags.has('slow')).toBe(true)
+    expect(chrome.storage.local.set).not.toHaveBeenCalledWith(
+      expect.objectContaining({ ovFilters: expect.anything() }))
+  })
+})
+
+describe('filter persistence', () => {
+  it('persists chips only — never the flags', () => {
+    seed(req({ id: 1, status: 500, ms: 10 }))
+    document.querySelector<HTMLButtonElement>('.ov-fstat-btn[data-f="err"]')!.click()
+    document.querySelector<HTMLButtonElement>('.ov-chip[data-m="POST"]')!.click()
+    expect(chrome.storage.local.set).toHaveBeenCalledWith(
+      { ovFilters: { status: [], methods: ['POST'], initiators: [] } })
+  })
+
+  it('marks restored chips on and applies them to the list', async () => {
+    ov = loadOverlay({ storage: { local: { ovFilters: { status: ['4xx'], methods: ['POST'] } } } })
+    await activateOverlay()
+    seed(req({ id: 1, method: 'GET',  status: 200 }),
+         req({ id: 2, method: 'POST', status: 404 }),
+         req({ id: 3, method: 'POST', status: 200 }))
+
+    const on = (sel: string) => document.querySelector(sel)?.classList.contains('on')
+    expect(on('.ov-chip[data-s="4xx"]')).toBe(true)
+    expect(on('.ov-chip[data-m="POST"]')).toBe(true)
+    expect(on('.ov-chip[data-s="2xx"]')).toBe(false)
+    expect(on('.ov-chip[data-m="GET"]')).toBe(false)
+    expect(rowIds()).toEqual(['2'])
+    expect(countText()).toBe('1/3')
+  })
+
+  it('ignores flags stored by older builds', async () => {
+    ov = loadOverlay({ storage: { local: { ovFilters: { flags: ['err', 'slow'] } } } })
+    await activateOverlay()
+    seed(req({ id: 1, status: 200, ms: 10 }), req({ id: 2, status: 200, ms: 10 }))
+    expect(ov.activeFlags.size).toBe(0)
+    expect(rowIds()).toEqual(['2', '1'])
+    expect(countText()).toBe('2/2')
+    expect(document.querySelector<HTMLButtonElement>('.ov-fstat-btn[data-f="err"]')!.disabled).toBe(true)
+  })
+
+  // restoreFilters runs inside the activation chain: a throw there means no
+  // overlay on any page, with no way back from the UI.
+  it('survives a corrupt ovFilters value without losing the overlay', async () => {
+    for (const bad of [{ status: 5 }, { methods: { x: 1 } }, { initiators: [1, null] }, 'junk', 42]) {
+      ov = loadOverlay({ storage: { local: { ovFilters: bad } } })
+      await activateOverlay()
+      seed(req({ id: 1, status: 200 }))
+      expect(document.getElementById('ov-panel'), `ovFilters=${JSON.stringify(bad)}`).not.toBeNull()
+      expect(rowIds()).toEqual(['1'])
+      expect(ov.activeStatus.size + ov.activeMethods.size + ov.activeInitiators.size).toBe(0)
+    }
+  })
+
+  it('keeps the string entries of a partly corrupt ovFilters value', async () => {
+    ov = loadOverlay({ storage: { local: { ovFilters: { status: ['4xx', 7, null], methods: 'POST' } } } })
+    await activateOverlay()
+    seed(req({ id: 1, status: 404 }), req({ id: 2, status: 200 }))
+    expect([...ov.activeStatus]).toEqual(['4xx'])
+    expect(ov.activeMethods.size).toBe(0)
+    expect(rowIds()).toEqual(['1'])
+  })
+
+  it('re-derives chip state on every render, so a click is reflected without a manual toggle', () => {
+    seed(req({ id: 1, method: 'GET', status: 200 }), req({ id: 2, method: 'POST', status: 200 }))
+    const post = document.querySelector<HTMLButtonElement>('.ov-chip[data-m="POST"]')!
+    post.click()
+    expect(post.classList.contains('on')).toBe(true)
+    expect(rowIds()).toEqual(['2'])
+    post.click()
+    expect(post.classList.contains('on')).toBe(false)
+    expect(rowIds()).toEqual(['2', '1'])
+  })
 })
 
 describe('detailPanelHtml', () => {
