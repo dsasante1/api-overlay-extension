@@ -10,7 +10,7 @@ A Chrome extension that intercepts and displays all API calls made by a web page
 - **Floating overlay panel** — draggable, dark/light-themed panel rendered on top of any allowed site; no DevTools required
 - **Request/response body preview** — click any row to expand and see payload; JSON is auto-pretty-printed
 - **WebSocket support** — tracks connection lifecycle and shows a scrollable sent/received message thread
-- **URL filtering and method filtering** — filter the list by URL substring or HTTP method (GET, POST, PUT, DELETE, PATCH, WS)
+- **Filtering** — search URL and request/response bodies (plain or regex, case toggle) and narrow by status class, HTTP method (GET, POST, PUT, PATCH, DELETE, WS), origin (page element vs. background) and the footer's `err` / `slow` flags
 - **Domain grouping** — toggle to group requests by hostname, with first-party vs third-party distinction
 - **HAR export** — export all captured HTTP requests as a standard `.har` file compatible with browser DevTools and analysis tools
 - **Pause / Resume** — freeze capture while keeping the current list visible
@@ -38,9 +38,9 @@ api-overlay-extension/
 
 ## How It Works
 
-The extension uses a two-script architecture required by Manifest V3's content security model:
+The extension uses a two-script architecture — Manifest V3 keeps content scripts in an isolated world, so patching the page's own `fetch` needs a second script that lives in the page's world:
 
-1. **`injected.ts`** runs in the **page world** (same JS context as the site). It monkey-patches `window.fetch`, `XMLHttpRequest.prototype.open/send`, and `window.WebSocket` to intercept all outgoing network requests. When a request starts or completes, it posts a message to `window` with full metadata.
+1. **`injected.ts`** runs in the **page world** (same JS context as the site). It is registered in the manifest as a `"world": "MAIN"` content script at `document_start`, so it is installed synchronously before any of the page's own scripts run and sees load-time requests (this key needs Chrome 111+, hence `minimum_chrome_version`). It monkey-patches `window.fetch`, `XMLHttpRequest.prototype.open/send`, and `window.WebSocket` to intercept all outgoing network requests. When a request starts or completes, it posts a message to `window` with full metadata.
 
 2. **`content.ts`** runs in the **content script world** (isolated from the page). It listens for those `window.postMessage` events and builds the overlay panel into the page DOM. It also tracks interaction state (hover → highlight, expand/collapse rows) and responds to commands from the popup.
 
@@ -111,8 +111,9 @@ The overlay is opt-in — it only activates on sites you explicitly allow.
 |---|---|
 | Expand a request | Click any row |
 | Highlight the trigger element | Hover a row |
-| Filter by URL | Type in the filter box |
-| Filter by method | Use the method dropdown |
+| Filter by text | Type in the filter box (matches URL and request/response bodies); **Aa** toggles case sensitivity, **.\*** toggles regex |
+| Filter by status / method / origin | Click the chips under the search box; chip selections persist across sites |
+| Filter errors / slow requests | Click **err** / **slow** in the footer (per page, not persisted) |
 | Group by domain | Click **Group** button |
 | Copy a URL | Click the **copy** button on a row |
 | Pause/resume capture | Click **Pause** / **Resume** in the panel or popup |
@@ -137,15 +138,15 @@ The **Export HAR** action generates a [HTTP Archive (HAR 1.2)](https://w3c.githu
 |---|---|
 | `tabs` | Read the active tab URL and ID to pre-fill the hostname input and send messages from the popup |
 | `activeTab` | Scope message sending to the current tab |
-| `storage` | Persist the `ovAllowedHosts` allowlist and UI preferences (theme, visibility, pause state) across sessions |
+| `storage` | Persist the `ovAllowedHosts` allowlist, UI preferences (theme, font, visibility, pause state, panel/pill position and dock state) and the status/method/origin chip filters across sessions — the chip filters are global, not per site |
 | `host_permissions: <all_urls>` | Allow the content script to load on all sites so it can receive an `activate` message when a hostname is added to the allowlist |
 
 ## Technical Notes
 
 - **Allowlist storage key:** `ovAllowedHosts` (`string[]`) in `chrome.storage.local` — matched against `location.hostname` on every page load.
-- On pages not in the allowlist the content script loads but does nothing: no script injection, no DOM modification, no event listeners beyond the `activate` message handler.
+- On pages not in the allowlist the capture hook is still installed (it has to be, to see load-time requests) but nothing is rendered: captured requests are held in a bounded in-memory buffer and replayed if the site is activated later. No DOM modification, no event listeners beyond the message handler.
 - When a hostname is added via the popup while that tab is open, an `activate` message is sent and the overlay appears live; no page reload required. Removing a hostname sends `deactivate`, which tears down the panel immediately.
-- The injected script is guarded by `window.__apiOverlayActive` to prevent double-injection if `activate` is sent more than once.
+- The page-world hook is guarded by `window.__apiOverlayActive` so it installs once per document; `activate` / `deactivate` only start and stop its emission.
 - XHR responses are only read as text when `responseType` is `''` or `'text'`; binary types (`arraybuffer`, `blob`) are captured as no body to avoid `InvalidStateError`.
 - Trigger element detection uses an 800 ms window from the last `mousedown`/`touchstart`/`keydown` event. Requests made outside that window are attributed to "background / auto".
 - CSS is injected with `!important` on every rule to avoid style bleed from the host page overriding the panel.

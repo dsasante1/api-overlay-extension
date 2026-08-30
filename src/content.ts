@@ -139,7 +139,6 @@ let currentFontFamily: FontFamilyKey = 'mono';
 let currentFontSize: FontSizeKey = 'm';
 
 let activated = false;
-let cspBlocked = false;
 let renderScheduled = false;
 let renderTimer: number | null = null;
 let lastRenderTime = 0;
@@ -365,7 +364,7 @@ function isSafeId(v: unknown): v is number {
 }
 
 // Requests intercepted by the injected hook before the overlay is activated. The
-// hook is installed at document_start (see injectHook) so it captures load-time
+// hook is installed at document_start (a MAIN-world content script) so it captures load-time
 // requests, but there is no UI to show them until the user activates. Buffer them
 // (bounded, oldest dropped on overflow) and replay via drainPreActivationBuffer
 // once the panel/pill is built.
@@ -1677,10 +1676,15 @@ function renderFooter(): void {
     if ((r.ms ?? 0) > 800) slow++;
     xfer += byteSize(r);
   }
+  // A zero-count button is inert — unless its flag is on. Then it must stay
+  // clickable: it is the only way to switch the flag off, and while it is on it
+  // hides every row.
+  const errOn = activeFlags.has('err');
+  const slowOn = activeFlags.has('slow');
   footer.innerHTML = `
     <span class="ov-fstat">req <b>${requests.size}</b></span>
-    <button class="ov-fstat ov-fstat-btn${err ? ' ov-fstat-err' : ''}${activeFlags.has('err') ? ' on' : ''}" data-f="err" ${err ? '' : 'disabled'} data-tip="Filter: error requests">err <b>${err}</b></button>
-    <button class="ov-fstat ov-fstat-btn${slow ? ' ov-fstat-warn' : ''}${activeFlags.has('slow') ? ' on' : ''}" data-f="slow" ${slow ? '' : 'disabled'} data-tip="Filter: slow (&gt;800ms)">slow <b>${slow}</b></button>
+    <button class="ov-fstat ov-fstat-btn${err ? ' ov-fstat-err' : ''}${errOn ? ' on' : ''}" data-f="err" ${err || errOn ? '' : 'disabled'} data-tip="Filter: error requests">err <b>${err}</b></button>
+    <button class="ov-fstat ov-fstat-btn${slow ? ' ov-fstat-warn' : ''}${slowOn ? ' on' : ''}" data-f="slow" ${slow || slowOn ? '' : 'disabled'} data-tip="Filter: slow (&gt;800ms)">slow <b>${slow}</b></button>
     <span class="ov-fstat">xfer <b>${(xfer / 1024).toFixed(1)}kb</b></span>
     <span class="ov-fspacer"></span>
     <span class="ov-fnote">${paused ? 'paused' : 'capturing'} · ${location.host}</span>
@@ -1771,15 +1775,6 @@ function listEmptyStateHtml(): string {
     `${requests.size} captured`)}</div>`;
 }
 
-function renderCspBlocked(list: HTMLElement, countEl: HTMLElement | null): void {
-  list.innerHTML = `<div class="ov-empty">${stateCardHtml('warn', '⚠', 'Capture blocked',
-    "This page's Content-Security-Policy stopped the capture hook from loading, so the live log cannot record anything here.",
-    'content-security-policy')}</div>`;
-  if (countEl) countEl.textContent = '0';
-  closeDock();
-  renderFooter();
-}
-
 // Mount a virtualizer for every visible JSON response placeholder.
 function mountVisibleJsonTrees(root: HTMLElement): void {
   for (const host of root.querySelectorAll<HTMLElement>('.ov-body-json[data-id]')) {
@@ -1844,7 +1839,7 @@ function renderList(): void {
   const countEl = $('ov-count');
   if (!list) return;
   syncViewTabs();
-  if (cspBlocked) { renderCspBlocked(list, countEl); return; }
+  syncChipState();
 
   const matcher = buildTextMatcher(filterInput?.value ?? '');
   filterInput?.classList.toggle('ov-filter-invalid', matcher.invalid);
@@ -1882,6 +1877,23 @@ function updateSearchHits(count: number): void {
   if (!el) return;
   const term = filterInput?.value ?? '';
   el.textContent = term ? `${count} hit${count === 1 ? '' : 's'}` : '';
+}
+
+// The active sets are the only source of truth for chip selection — they may
+// have been restored from storage after the chips were built idle — so every
+// render re-derives the .on class from them.
+function chipIsOn(chip: HTMLElement): boolean {
+  const { s, m, i } = chip.dataset;
+  if (s) return activeStatus.has(s);
+  if (m) return activeMethods.has(m);
+  if (i) return activeInitiators.has(i);
+  return false;
+}
+
+function syncChipState(): void {
+  for (const chip of document.querySelectorAll<HTMLElement>('#ov-chips .ov-chip')) {
+    chip.classList.toggle('on', chipIsOn(chip));
+  }
 }
 
 function updateChipCounts(snapshot: ApiRequest[]): void {
@@ -2127,24 +2139,24 @@ function bindChipDelegation(container: HTMLElement): void {
 
     if (s) {
       activeStatus.has(s) ? activeStatus.delete(s) : activeStatus.add(s);
-      chip.classList.toggle('on', activeStatus.has(s));
     } else if (m) {
       activeMethods.has(m) ? activeMethods.delete(m) : activeMethods.add(m);
-      chip.classList.toggle('on', activeMethods.has(m));
     } else if (ini) {
       activeInitiators.has(ini) ? activeInitiators.delete(ini) : activeInitiators.add(ini);
-      chip.classList.toggle('on', activeInitiators.has(ini));
     }
 
     persistFilters();
-    renderList();
+    renderList();   // syncChipState (called within) re-derives the .on state
   });
 }
 
+// Only the chips persist. The err/slow flags describe the current log, so they
+// are meaningless on the next page — and once carried over to a page with no
+// errors they would hide every row.
 function persistFilters(): void {
   chrome.storage.local.set({ ovFilters: {
     status: [...activeStatus], methods: [...activeMethods],
-    initiators: [...activeInitiators], flags: [...activeFlags],
+    initiators: [...activeInitiators],
   }});
 }
 
@@ -2155,7 +2167,6 @@ function bindFooterDelegation(container: HTMLElement): void {
     const f = btn.dataset.f;
     if (!f) return;
     activeFlags.has(f) ? activeFlags.delete(f) : activeFlags.add(f);
-    persistFilters();
     renderList();   // renderFooter (called within) re-derives the .on state
   });
 }
@@ -4398,35 +4409,21 @@ ${smStylesCss()}
 
 // ── Activation / deactivation ─────────────────────────────────────────────────
 
-let injectionAttempted = false;
-
-// Install the page-context capture hook as early as possible (document_start,
-// before the page's own scripts run) so requests fired during initial load are
-// intercepted. The hook emits unconditionally; the overlay decides whether to
-// display or buffer (see the message listener). Injected once per page load.
-function injectHook(): void {
-  if (injectionAttempted) return;
-  injectionAttempted = true;
-  const script = document.createElement('script');
-  script.src = chrome.runtime.getURL('dist/injected.js');
-  // Preserve execution order relative to other parser/script-inserted scripts so
-  // the hook wins the race against the page's own early scripts where possible.
-  script.async = false;
-  script.onload = () => { script.remove(); };
-  script.onerror = () => { script.remove(); cspBlocked = true; if (activated) renderList(); };
-  (document.head || document.documentElement).prepend(script);
-}
-
 // The activation chain, flattened into named steps: theme → stored state →
 // preserved log → surface. Each step is top-level so the callbacks don't nest.
 
+// Chips only. Older builds also stored `flags`; that key is deliberately
+// ignored so a stuck err/slow flag from before does not come back. Anything
+// that is not a string array is dropped: this runs inside the activation
+// chain, and a throw here would leave the page with no overlay at all.
 function restoreFilters(saved: unknown): void {
-  if (!saved) return;
-  const f = saved as { status?: string[]; methods?: string[]; initiators?: string[]; flags?: string[] };
-  if (f.status) for (const s of f.status) activeStatus.add(s);
-  if (f.methods) for (const m of f.methods) activeMethods.add(m);
-  if (f.initiators) for (const i of f.initiators) activeInitiators.add(i);
-  if (f.flags) for (const fl of f.flags) activeFlags.add(fl);
+  if (!saved || typeof saved !== 'object') return;
+  const f = saved as Record<string, unknown>;
+  const strings = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+  for (const s of strings(f.status)) activeStatus.add(s);
+  for (const m of strings(f.methods)) activeMethods.add(m);
+  for (const i of strings(f.initiators)) activeInitiators.add(i);
 }
 
 function buildOverlaySurface(): void {
@@ -4464,8 +4461,9 @@ function applyLoadedTheme(theme: 'dark' | 'light'): void {
 function activateOverlay(): void {
   if (activated) return;
   activated = true;
-  // The capture hook is already installed at document_start (injectHook); here we
-  // only (re)enable emission in case a prior deactivate stopped it. Requests seen
+  // The capture hook (dist/injected.js, a MAIN-world content script) is already
+  // installed at document_start; here we only (re)enable emission in case a
+  // prior deactivate stopped it. Requests seen
   // before activation were buffered and are replayed by drainPreActivationBuffer.
   signalInjected('start');
 
@@ -4592,12 +4590,6 @@ window.addEventListener('keyup', (e: KeyboardEvent) => {
   $('ov-panel')?.classList.remove('ov-ghost');
   $('ov-pill')?.classList.remove('ov-ghost');
 });
-
-// Install the capture hook now, at document_start, regardless of whether the
-// overlay is ever activated — otherwise requests fired during initial page load
-// (common on server-rendered / jQuery sites) are gone before the user opens the
-// overlay. Captured-but-undisplayed requests are buffered until activation.
-injectHook();
 
 // ── Host allowlist ────────────────────────────────────────────────────────────
 
