@@ -21,3 +21,4 @@ dist/
 .sonar_lock
 report-task.txt
 .scannerwork/
+callout.zip
